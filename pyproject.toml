@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "windbg-mcp"
+version = "0.1.0"
+description = "MCP server for WinDbg — AI-driven kernel and user-mode debugging"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "mcp>=1.0.0",
+    "starlette>=0.38.0",
+    "uvicorn>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+windbg-mcp = "src.server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
