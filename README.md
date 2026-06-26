@@ -122,68 +122,163 @@ Windbg GUI 和 AI Agent 共享同一调试会话，互不干扰。
 
 ## 可用工具
 
-### 执行控制
+`windbg_exec` 透传覆盖所有 WinDbg 命令，以下列出全部功能及对应工具。
 
-| 工具 | 参数 | 说明 |
-|------|------|------|
-| `windbg_go` | — | 继续运行 (g) |
-| `windbg_step_into` | count (可选) | 单步进入 (t)，默认 1 步 |
-| `windbg_step_over` | count (可选) | 单步跳过 (p)，默认 1 步 |
-| `windbg_step_out` | — | 跳出函数 (gu) |
+### 一、执行控制
 
-### 断点
+| WinDbg 命令 | 功能 | MCP 工具 |
+|-------------|------|----------|
+| `g` Go | 继续运行 | `windbg_go` |
+| `p` Step | 单步跳过 | `windbg_step_over` |
+| `t` Trace | 单步进入 | `windbg_step_into` |
+| `gu` Go Up | 跳出函数 | `windbg_step_out` |
+| `pa` Step to Address | 单步到地址 | `windbg_exec` |
+| `pc` Step to Next Call | 单步到调用 | `windbg_exec` |
+| `pt` Step to Return | 单步到返回 | `windbg_exec` |
+| `gc/gh/gn/gN` | 条件/异常继续 | `windbg_exec` |
 
-| 工具 | 参数 | 说明 |
-|------|------|------|
-| `windbg_bp_set` | address, condition (可选) | 设置断点，符号/地址/条件表达式 |
-| `windbg_bp_list` | — | 列出所有断点及命中次数 |
-| `windbg_bp_clear` | id | 按 ID 清除，`*` 清除全部 |
-| `windbg_bp_enable` | id | 启用断点 |
-| `windbg_bp_disable` | id | 禁用断点 |
+### 二、断点
 
-### 内存 & 寄存器
+| WinDbg 命令 | 功能 | MCP 工具 |
+|-------------|------|----------|
+| `bp/bu/bm` Set Breakpoint | 设置断点 | `windbg_bp_set` |
+| `bl` Breakpoint List | 列出断点 | `windbg_bp_list` |
+| `bc` Breakpoint Clear | 清除断点 | `windbg_bp_clear` |
+| `bd` Breakpoint Disable | 禁用断点 | `windbg_bp_disable` |
+| `be` Breakpoint Enable | 启用断点 | `windbg_bp_enable` |
+| `ba` Break on Access | 内存访问断点 | `windbg_exec` |
+| `br` Breakpoint Renumber | 重编号 | `windbg_exec` |
+| `bs` Update Breakpoint Command | 更新断点命令 | `windbg_exec` |
+| `bsc` Update Conditional BP | 更新条件断点 | `windbg_exec` |
 
-| 工具 | 参数 | 说明 |
-|------|------|------|
-| `windbg_mem_read` | address, size (可选), format (可选) | 读内存，format: byte/word/dword/qword/ascii |
-| `windbg_mem_write` | address, bytes | 写内存，空格分隔十六进制 |
-| `windbg_mem_search` | start, end, pattern | 搜索内存模式 |
-| `windbg_reg_read` | reg (可选) | 读寄存器，空则返回全部 |
-| `windbg_reg_write` | reg, value | 写寄存器 |
+### 三、内存操作
 
-### 反汇编 & 栈帧
+| WinDbg 命令 | 功能 | MCP 工具 |
+|-------------|------|----------|
+| `db/dd/dq/du/da...` Display Memory | 读内存 | `windbg_mem_read` |
+| `eb/ed/eq...` Enter Values | 写内存 | `windbg_mem_write` |
+| `s` Search Memory | 搜索内存 | `windbg_mem_search` |
+| `c` Compare Memory | 比较内存 | `windbg_exec` |
+| `f` Fill Memory | 填充内存 | `windbg_exec` |
+| `m` Move Memory | 移动内存 | `windbg_exec` |
+| `dds/dps/dqs` Words & Symbols | 符号化显示 | `windbg_exec` |
+| `dl` Display Linked List | 显示链表 | `windbg_exec` |
+| `ds` Display String | 显示字符串 | `windbg_exec` |
 
-| 工具 | 参数 | 说明 |
-|------|------|------|
-| `windbg_disasm` | address, count (可选) | 反汇编，默认 8 条指令 |
-| `windbg_stack` | count (可选), params (可选) | 调用栈，Markdown 表格 (Frame / Call Site / Child-SP / RetAddr) |
-| `windbg_stack_frame` | frame | 查看指定栈帧局部变量/参数 |
+### 四、寄存器
 
-### 蓝屏 & 符号 & 类型
+| WinDbg 命令 | 功能 | MCP 工具 |
+|-------------|------|----------|
+| `r` Registers | 读/写寄存器 | `windbg_reg_read` / `windbg_reg_write` |
+| `rm` Register Mask | 寄存器掩码 | `windbg_exec` |
+| `rdmsr/wrmsr` | 读/写 MSR | `windbg_exec` |
 
-| 工具 | 参数 | 说明 |
-|------|------|------|
-| `windbg_analyze` | — | 自动化崩溃分析 (!analyze -v) |
-| `windbg_bugcheck` | — | 获取 BugCheck 码及参数 |
-| `windbg_sym_lookup` | pattern, type (可选) | 按通配符搜索符号 |
-| `windbg_sym_name` | address | 地址 → 符号名 (ln) |
-| `windbg_dt` | type, address (可选), depth (可选) | 显示类型结构 (dt) |
-| `windbg_eval` | expression | 求值表达式 (? 或 ??) |
+### 五、反汇编
 
-### 内核信息
+| WinDbg 命令 | 功能 | MCP 工具 |
+|-------------|------|----------|
+| `u` Unassemble | 反汇编 | `windbg_disasm` |
+| `uf` Unassemble Function | 反汇编整个函数 | `windbg_exec` |
+| `up` Unassemble Physical | 物理地址反汇编 | `windbg_exec` |
+| `a` Assemble | 汇编写入 | `windbg_exec` |
+| `#` Search Disasm Pattern | 反汇编模式搜索 | `windbg_exec` |
 
-| 工具 | 参数 | 说明 |
-|------|------|------|
-| `windbg_process_list` | — | 枚举所有进程 |
-| `windbg_process_info` | address | 进程详细信息 (_EPROCESS 地址) |
-| `windbg_module_list` | — | 枚举内核模块/驱动 |
-| `windbg_status` | — | 调试器连接状态 |
+### 六、栈帧
+
+| WinDbg 命令 | 功能 | MCP 工具 |
+|-------------|------|----------|
+| `k/kb/kp/kP/kv` Stack Backtrace | 调用栈 (Markdown 表格) | `windbg_stack` |
+| `.frame` Set Current Frame | 切换帧 | `windbg_exec` |
+| `dv` Display Local Variables | 局部变量 | `windbg_stack_frame` |
+| `wt` Trace and Watch Data | 跟踪监视 | `windbg_exec` |
+
+### 七、符号
+
+| WinDbg 命令 | 功能 | MCP 工具 |
+|-------------|------|----------|
+| `x` Examine Symbols | 搜索符号 | `windbg_sym_lookup` |
+| `ln` List Nearest Symbols | 地址 → 符号名 | `windbg_sym_name` |
+| `ld` Load Symbols | 加载符号 | `windbg_exec` |
+| `.sympath` Set Symbol Path | 符号路径 | `windbg_exec` |
+| `.reload` Reload Module | 重载模块 | `windbg_exec` |
+
+### 八、类型 & 表达式
+
+| WinDbg 命令 | 功能 | MCP 工具 |
+|-------------|------|----------|
+| `dt` Display Type | 显示类型结构 | `windbg_dt` |
+| `?` Evaluate Expression | MASM 表达式求值 | `windbg_eval` |
+| `??` Evaluate C++ Expression | C++ 表达式求值 | `windbg_eval` |
+
+### 九、进程 & 线程
+
+| WinDbg 命令 | 功能 | MCP 工具 |
+|-------------|------|----------|
+| `!process` | 进程枚举/详情 | `windbg_process_list` / `windbg_process_info` |
+| `|` Process Status | 进程状态 | `windbg_exec` |
+| `|s` Set Current Process | 切换进程 | `windbg_exec` |
+| `~` Thread Status | 线程状态 | `windbg_exec` |
+| `~s` Set Current Thread | 切换线程 | `windbg_exec` |
+| `~f/~u` Freeze/Unfreeze | 冻结/解冻线程 | `windbg_exec` |
+| `~n/~m` Suspend/Resume | 挂起/恢复线程 | `windbg_exec` |
+| `!thread` | 线程详情 | `windbg_exec` |
+| `!peb` / `!teb` | PEB/TEB 信息 | `windbg_exec` |
+
+### 十、模块 & 驱动
+
+| WinDbg 命令 | 功能 | MCP 工具 |
+|-------------|------|----------|
+| `lm` List Loaded Modules | 列出模块 | `windbg_module_list` |
+| `!drvobj` | 驱动对象信息 | `windbg_exec` |
+| `!devnode` / `!devstack` | 设备节点/栈 | `windbg_exec` |
+| `!devobj` | 设备对象 | `windbg_exec` |
+
+### 十一、崩溃分析
+
+| WinDbg 命令 | 功能 | MCP 工具 |
+|-------------|------|----------|
+| `!analyze -v` | 自动化崩溃分析 | `windbg_analyze` |
+| `.bugcheck` | BugCheck 码及参数 | `windbg_bugcheck` |
+| `.dump` Create Dump | 创建转储文件 | `windbg_exec` |
+| `.crash` Force Crash | 强制崩溃 | `windbg_exec` |
+| `.ecxr` Exception Context | 异常上下文记录 | `windbg_exec` |
+| `.exr` Exception Record | 异常记录 | `windbg_exec` |
+| `sx/sxd/sxe/sxi` | 异常控制 | `windbg_exec` |
+
+### 十二、内核专用
+
+| WinDbg 命令 | 功能 | MCP 工具 |
+|-------------|------|----------|
+| `!irql` | 查看 IRQL 等级 | `windbg_exec` |
+| `!locks` | 锁信息 | `windbg_exec` |
+| `!handle` | 句柄信息 | `windbg_exec` |
+| `!vm` | 虚拟内存统计 | `windbg_exec` |
+| `!memusage` | 物理内存统计 | `windbg_exec` |
+| `!poolused` / `!poolfind` | 内存池统计 | `windbg_exec` |
+| `!object` | 内核对象 | `windbg_exec` |
+| `!idt` / `!gdt` / `!tss` | 描述符表 | `windbg_exec` |
+| `!sysinfo` / `!cpuid` | 系统/CPU 信息 | `windbg_exec` |
+| `!pcr` / `!prcb` | 处理器控制区 | `windbg_exec` |
+| `!cs` / `!dpcs` / `!apc` | 临界区/DPC/APC | `windbg_exec` |
+| `!ioapic` / `!pic` | APIC/PIC 信息 | `windbg_exec` |
+| `!pfn` | PFN 数据库 | `windbg_exec` |
+
+### 十三、会话 & 状态
+
+| WinDbg 命令 | 功能 | MCP 工具 |
+|-------------|------|----------|
+| `.lastevent` | 最后事件 | `windbg_status` |
+| `||` System Status | 系统状态 | `windbg_exec` |
+| `.server` / `.endsrv` | 调试服务器 | `windbg_exec` |
+| `q/qd` Quit/Detach | 退出/分离 | `windbg_exec` |
+| `version` / `vertarget` | 版本信息 | `windbg_exec` |
+| `n` Set Number Base | 设置基数 | `windbg_exec` |
 
 ### 透传
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
-| `windbg_exec` | command | 执行任意 Windbg 命令，支持所有指令 |
+| `windbg_exec` | command | 执行任意 Windbg 命令，以上 `windbg_exec` 项均通过此工具完成 |
 
 ## CLI 参数
 
