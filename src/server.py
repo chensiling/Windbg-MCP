@@ -88,22 +88,22 @@ def main():
     mcp = FastMCP("windbg-mcp", host="127.0.0.1", port=config.http_port)
 
     from .tools.exec_tool import register_exec_tool
-    from .tools.control_tools import register_control_tools
-    from .tools.breakpoint_tools import register_breakpoint_tools
-    from .tools.memory_tools import register_memory_tools
-    from .tools.register_tools import register_register_tools
-    from .tools.disasm_tools import register_disasm_tools
-    from .tools.stack_tools import register_stack_tools
-    from .tools.symbol_tools import register_symbol_tools
-    from .tools.analyze_tools import register_analyze_tools
-    from .tools.kernel_tools import register_kernel_tools
-    from .tools.type_tools import register_type_tools
+    from .tools.control_tool import register_control_tool
+    from .tools.breakpoint_tool import register_breakpoint_tool
+    from .tools.memory_tool import register_memory_tool
+    from .tools.disasm_tool import register_disasm_tool
+    from .tools.stack_tool import register_stack_tool
+    from .tools.lookup_tool import register_lookup_tool
+    from .tools.analyze_tool import register_analyze_tool
+    from .tools.eval_tool import register_eval_tool
+    from .tools.context_tool import register_context_tool
+    from .tools.sympath_tool import register_sympath_tool
 
     for reg in [
-        register_exec_tool, register_control_tools, register_breakpoint_tools,
-        register_memory_tools, register_register_tools, register_disasm_tools,
-        register_stack_tools, register_symbol_tools, register_analyze_tools,
-        register_kernel_tools, register_type_tools,
+        register_exec_tool, register_control_tool, register_breakpoint_tool,
+        register_memory_tool, register_disasm_tool, register_stack_tool,
+        register_lookup_tool, register_analyze_tool, register_eval_tool,
+        register_context_tool, register_sympath_tool,
     ]:
         reg(mcp)
 
