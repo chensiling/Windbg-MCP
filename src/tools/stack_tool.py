@@ -2,6 +2,7 @@
 
 from ._registry import _exec
 from ._parser import parse_stack_k, parse_stack_kp
+from ._response import is_error_output, make_error, make_response, next_action, parse_int_arg, parsed_response
 
 
 def register_stack_tool(mcp):
@@ -18,15 +19,40 @@ def register_stack_tool(mcp):
         - 指定 frame: 该帧的局部变量原始输出。
         """
         if frame:
-            return _exec(f".frame {frame}; dv /t /i")
+            frame_no, arg_error = parse_int_arg(frame, "frame", min_value=0, max_value=200)
+            if arg_error:
+                return make_response("windbg_backtrace", "", ok=False, errors=[arg_error])
+            command = f".frame {frame_no}; dv /t /i"
+            raw = _exec(command)
+            if is_error_output(raw):
+                return make_error("windbg_backtrace", command, "debugger_error", raw.strip(), raw=raw)
+            return make_response(
+                "windbg_backtrace",
+                command,
+                data={"frame": frame_no, "locals_raw": raw.strip()},
+                raw=raw,
+            )
 
-        n = max(1, int(depth))
+        n, arg_error = parse_int_arg(depth, "depth", default=20, min_value=1, max_value=200)
+        if arg_error:
+            return make_response("windbg_backtrace", "", ok=False, errors=[arg_error])
+
         if show_params.lower() in ("true", "1", "yes"):
-            raw = _exec(f"kP {n}")
+            command = f"kP {n}"
+            raw = _exec(command)
         else:
-            raw = _exec(f"k {n}")
+            command = f"k {n}"
+            raw = _exec(command)
 
         parsed = parse_stack_kp(raw) if show_params.lower() in ("true", "1", "yes") else parse_stack_k(raw)
-        if "raw" in parsed:
-            return parsed["raw"]
-        return str(parsed)
+        actions = []
+        if "raw" not in parsed and parsed.get("frames"):
+            actions.append(next_action("windbg_disassemble", {"at": "@rip", "count": "8"}, "Inspect instructions near the current frame."))
+        return parsed_response(
+            "windbg_backtrace",
+            command,
+            parsed,
+            raw,
+            data={**parsed, "depth": n} if "raw" not in parsed else None,
+            next_actions=actions,
+        )

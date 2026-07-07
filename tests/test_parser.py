@@ -13,9 +13,13 @@ from tools._parser import (
     parse_memory_dump,
     parse_modules,
     parse_symbol_list,
+    parse_nearest_symbol,
     parse_type_info,
+    parse_evaluate,
     parse_analyze,
     parse_process_list,
+    parse_thread_list_user,
+    parse_breakpoints,
 )
 
 
@@ -46,10 +50,18 @@ SAMPLE_STACK_KP = """Child-SP          RetAddr               Call Site
 000000f7`c79ff380 00007ff9`8502b854e     ntdll!LdrpInitializeInternal+0x5a
 000000f7`c79ff3d0 00000000`00000000     ntdll!LdrInitializeThunk+0xe"""
 
+SAMPLE_STACK_KP_INDEXED = """0: kd>  # Child-SP          RetAddr               Call Site
+00 ffff968b`f8207708 fffff805`2d9c18d0     nt!DbgBreakPointWithStatus
+01 ffff968b`f8207710 fffff805`2d9c1718     kdnic!TXTransmitQueuedSends+0x180"""
+
 SAMPLE_DISASM = """ntdll!LdrpDoDebuggerBreak+0x35:
 00007ff9`850bd78d cc              int     3
 00007ff9`850bd78e eb00            jmp     ntdll!LdrpDoDebuggerBreak+0x38 (00007ff9`850bd790)
 00007ff9`850bd790 4883c438        add     rsp,38h"""
+
+SAMPLE_DISASM_PROMPT = """0: kd> nt!DbgBreakPointWithStatus:
+fffff805`990f90d0 cc              int     3
+fffff805`990f90d1 c3              ret"""
 
 SAMPLE_MEM_DD = """00007ff9`850bd78d  4800ebcc c338c483 cccccccc 48cccccc"""
 
@@ -59,16 +71,25 @@ SAMPLE_MEM_DQ = """0000008e`77e7f0f0  00007ff9`8513a090 00007ff9`85097191
 SAMPLE_MEM_DB = """00007ff9`850bd78d  cc eb 00 48 83 c4 38 c3-cc cc cc cc cc cc cc 48  ...H..8........H
 00007ff9`850bd79d  83 ec 28 65 48 8b 0c 25-60 00 00 00 33 d2 41 b8  ..(eH..%`...3.A."""
 
+SAMPLE_MEM_DB_PROMPT = """0: kd> fffff805`990f90d0  cc c3 cc cc cc cc cc cc-0f 1f 84 00 00 00 00 00  ................"""
+
 SAMPLE_MODULES = """start             end                 module name
 00007ff9`84fa0000 00007ff9`85206000   ntdll      (pdb symbols)          C:\\ProgramData\\dbg\\sym\\ntdll.pdb\\23ADECD9479F123BF50906CE9B88193F1\\ntdll.pdb"""
 
 SAMPLE_SYMBOLS = """00007ff9`84fb00f0 ntdll!LdrpDoPostSnapWork (void)
 00007ff9`850bd758 ntdll!LdrpDoDebuggerBreak (LdrpDoDebuggerBreak)"""
 
+SAMPLE_LN = """Browse module
+Set bu breakpoint
+
+(00007ff9`850bd758)   ntdll!LdrpDoDebuggerBreak+0x35   |  (00007ff9`850bd790)   ntdll!LdrpDoDebuggerBreak+0x68"""
+
 SAMPLE_TYPE_INFO = """   +0x000 NtTib            : _NT_TIB
    +0x038 EnvironmentPointer : Ptr64 Void
    +0x040 ClientId         : _CLIENT_ID
    +0x050 ActiveRpcHandle  : Ptr64 Void"""
+
+SAMPLE_EVALUATE = """Evaluate expression: 140709204350861 = 00007ff9`850bd78d"""
 
 SAMPLE_ANALYZE_QUICK = """BUGCHECK_CODE:  1e
 
@@ -90,6 +111,14 @@ PROCESS ffffcf8f9c5e5080
     SessionId: 1  Cid: 5678    Peb: 12a54e0000  ParentCid: 01234
     DirBase: 12a54e002  ObjectTable: ffffcf8f9c5e5080  HandleCount: 456.
     Image: explorer.exe"""
+
+SAMPLE_THREADS_USER = """.  0  Id: 1234.5678 Suspend: 1 Teb: 00000083`7ea20000 Unfrozen
+#  1  Id: 1234.5679 Suspend: 0 Teb: 00000083`7ea30000 Unfrozen"""
+
+SAMPLE_BREAKPOINTS = """ 0 e Disable Clear  00007ff9`850bd78d     0001 (0001)  0:**** ntdll!LdrpDoDebuggerBreak
+ 1 d Disable Clear  00007ff9`850bd790     0001 (0001)  0:**** ntdll!Other"""
+
+SAMPLE_BREAKPOINTS_EMPTY = """0: kd> """
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +162,15 @@ class TestParseStack:
         assert len(frames) == 5
         assert result["has_params"] is True
 
+    def test_parse_kp_with_frame_index_and_prompt(self):
+        result = parse_stack_kp(SAMPLE_STACK_KP_INDEXED)
+        frames = result["frames"]
+        assert len(frames) == 2
+        assert frames[0]["index"] == "00"
+        assert frames[0]["child_sp"] == "0xffff968bf8207708"
+        assert frames[0]["ret_addr"] == "0xfffff8052d9c18d0"
+        assert frames[0]["call_site"] == "nt!DbgBreakPointWithStatus"
+
     def test_parse_k_no_header(self):
         result = parse_stack_k("garbage text")
         assert result["raw"] == "garbage text"
@@ -146,6 +184,12 @@ class TestParseDisassembly:
         assert insns[0]["instruction"] == "int 3"
         assert insns[0]["symbol"] == "ntdll!LdrpDoDebuggerBreak+0x35"
         assert insns[1]["instruction"] == "jmp ntdll!LdrpDoDebuggerBreak+0x38"
+
+    def test_parse_prompt_label(self):
+        result = parse_disassembly(SAMPLE_DISASM_PROMPT)
+        insns = result["instructions"]
+        assert insns[0]["symbol"] == "nt!DbgBreakPointWithStatus"
+        assert insns[1]["instruction"] == "ret"
 
     def test_empty(self):
         result = parse_disassembly("")
@@ -169,6 +213,13 @@ class TestParseMemoryDump:
         assert result["format"] == "hex_byte"
         assert len(result["data"]) >= 16
         assert result["data"][0]["value"] == "cc"
+
+    def test_parse_db_with_prompt(self):
+        result = parse_memory_dump(SAMPLE_MEM_DB_PROMPT)
+        assert result["address"] == "0xfffff805990f90d0"
+        assert result["format"] == "hex_byte"
+        assert len(result["data"]) == 16
+        assert result["data"][1]["value"] == "c3"
 
 
 class TestParseModules:
@@ -195,6 +246,17 @@ class TestParseSymbolList:
         assert result["raw"] == ""
 
 
+class TestParseNearestSymbol:
+    def test_parse(self):
+        result = parse_nearest_symbol(SAMPLE_LN)
+        assert result["symbol"]["address"] == "0x00007ff9850bd758"
+        assert result["symbol"]["name"] == "ntdll!LdrpDoDebuggerBreak+0x35"
+
+    def test_empty(self):
+        result = parse_nearest_symbol("no symbol")
+        assert result["raw"] == "no symbol"
+
+
 class TestParseTypeInfo:
     def test_parse(self):
         result = parse_type_info(SAMPLE_TYPE_INFO)
@@ -206,6 +268,17 @@ class TestParseTypeInfo:
     def test_empty(self):
         result = parse_type_info("random text")
         assert result["raw"] == "random text"
+
+
+class TestParseEvaluate:
+    def test_parse(self):
+        result = parse_evaluate(SAMPLE_EVALUATE)
+        assert result["decimal"] == 140709204350861
+        assert result["hex"] == "0x00007ff9850bd78d"
+
+    def test_empty(self):
+        result = parse_evaluate("not an eval result")
+        assert result["raw"] == "not an eval result"
 
 
 class TestParseAnalyze:
@@ -234,6 +307,38 @@ class TestParseProcessList:
         assert result["raw"] == "garbage"
 
 
+class TestParseThreadListUser:
+    def test_parse(self):
+        result = parse_thread_list_user(SAMPLE_THREADS_USER)
+        threads = result["threads"]
+        assert len(threads) == 2
+        assert threads[0]["current"] is True
+        assert threads[1]["event"] is True
+        assert threads[0]["teb"] == "0x000000837ea20000"
+
+    def test_empty(self):
+        result = parse_thread_list_user("kernel mode output")
+        assert result["raw"] == "kernel mode output"
+
+
+class TestParseBreakpoints:
+    def test_parse(self):
+        result = parse_breakpoints(SAMPLE_BREAKPOINTS)
+        breakpoints = result["breakpoints"]
+        assert len(breakpoints) == 2
+        assert breakpoints[0]["enabled"] is True
+        assert breakpoints[1]["enabled"] is False
+        assert breakpoints[0]["address"] == "0x00007ff9850bd78d"
+
+    def test_empty(self):
+        result = parse_breakpoints("no breakpoints")
+        assert result["raw"] == "no breakpoints"
+
+    def test_empty_prompt_means_no_breakpoints(self):
+        result = parse_breakpoints(SAMPLE_BREAKPOINTS_EMPTY)
+        assert result["breakpoints"] == []
+
+
 class TestFailback:
     """所有解析器失败时必须返回 {"raw": ...} 而不是抛异常"""
 
@@ -241,8 +346,9 @@ class TestFailback:
         parsers = [
             parse_registers, parse_stack_k, parse_stack_kp,
             parse_disassembly, parse_memory_dump, parse_modules,
-            parse_symbol_list, parse_type_info, parse_analyze,
-            parse_process_list,
+            parse_symbol_list, parse_nearest_symbol, parse_type_info,
+            parse_evaluate, parse_analyze, parse_process_list,
+            parse_thread_list_user, parse_breakpoints,
         ]
         for parser in parsers:
             result = parser("")
@@ -252,8 +358,9 @@ class TestFailback:
         parsers = [
             parse_registers, parse_stack_k, parse_stack_kp,
             parse_disassembly, parse_memory_dump, parse_modules,
-            parse_symbol_list, parse_type_info, parse_analyze,
-            parse_process_list,
+            parse_symbol_list, parse_nearest_symbol, parse_type_info,
+            parse_evaluate, parse_analyze, parse_process_list,
+            parse_thread_list_user, parse_breakpoints,
         ]
         garbage = "!@#$%^&*()_+\nnothing\n12345\n"
         for parser in parsers:

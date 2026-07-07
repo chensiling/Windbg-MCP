@@ -1,6 +1,8 @@
 """表达式求值工具。"""
 
 from ._registry import _exec
+from ._parser import parse_evaluate
+from ._response import make_error, parsed_response
 
 
 def register_eval_tool(mcp):
@@ -21,4 +23,17 @@ def register_eval_tool(mcp):
         - windbg_evaluate("poi(@rsp+8)")
         - windbg_evaluate("sizeof(nt!_EPROCESS)")
         """
-        return _exec(f"? {expression}")
+        if not expression.strip():
+            return make_error("windbg_evaluate", "", "invalid_argument", "'expression' is required.")
+
+        command = f"? {expression}"
+        raw = _exec(command)
+        parsed = parse_evaluate(raw)
+        return parsed_response(
+            "windbg_evaluate",
+            command,
+            parsed,
+            raw,
+            data={**parsed, "expression": expression} if "raw" not in parsed else None,
+            next_actions=[],
+        )

@@ -9,6 +9,13 @@ import re
 from typing import Any
 
 
+_RE_DEBUGGER_PROMPT = re.compile(r"^\s*\d+:\s*[^>]+>\s*")
+
+
+def _clean_line(line: str) -> str:
+    return _RE_DEBUGGER_PROMPT.sub("", line.rstrip())
+
+
 def _failback(raw: str) -> dict[str, str]:
     return {"raw": raw}
 
@@ -48,7 +55,7 @@ def parse_registers(raw: str) -> dict[str, Any]:
     segments: dict[str, str] = {}
     current: dict[str, str] = {}
 
-    lines = [l.rstrip() for l in raw.split("\n")]
+    lines = [_clean_line(l) for l in raw.split("\n")]
 
     for line in lines:
         # 跳过段寄存器和标志行
@@ -108,7 +115,8 @@ def parse_registers(raw: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _RE_STACK_LINE = re.compile(
-    r"^\s*(?P<child_sp>[0-9a-f`]+)\s+(?P<ret_addr>[0-9a-f`]+)\s+(?P<call_site>.+)$",
+    r"^\s*(?:(?P<index>[0-9a-f]+)\s+)?(?P<child_sp>[0-9a-f`]+)\s+"
+    r"(?P<ret_addr>[0-9a-f`]+)\s+(?P<call_site>.+)$",
     re.IGNORECASE,
 )
 
@@ -124,7 +132,7 @@ def _parse_stack_core(raw: str, has_params: bool) -> dict[str, Any]:
     header_seen = False
 
     for line in raw.split("\n"):
-        line = line.rstrip()
+        line = _clean_line(line)
         if not line.strip():
             continue
 
@@ -139,11 +147,14 @@ def _parse_stack_core(raw: str, has_params: bool) -> dict[str, Any]:
         if not m:
             continue
 
-        frames.append({
+        frame = {
             "child_sp": "0x" + m.group("child_sp").replace("`", ""),
             "ret_addr": "0x" + m.group("ret_addr").replace("`", ""),
             "call_site": m.group("call_site").strip(),
-        })
+        }
+        if m.group("index") is not None:
+            frame["index"] = m.group("index")
+        frames.append(frame)
 
     if not frames:
         return _failback(raw)
@@ -180,7 +191,7 @@ def parse_disassembly(raw: str) -> dict[str, Any]:
     current_label: str | None = None
 
     for line in raw.split("\n"):
-        line = line.rstrip()
+        line = _clean_line(line)
         if not line.strip():
             continue
 
@@ -236,7 +247,7 @@ def parse_memory_dump(raw: str) -> dict[str, Any]:
     format_type = "hex_dword"
 
     for line in raw.split("\n"):
-        line = line.rstrip()
+        line = _clean_line(line)
         if not line.strip():
             continue
 
@@ -311,7 +322,7 @@ def parse_modules(raw: str) -> dict[str, Any]:
     header_seen = False
 
     for line in raw.split("\n"):
-        line = line.rstrip()
+        line = _clean_line(line)
         if not line.strip():
             continue
 
@@ -359,7 +370,7 @@ def parse_symbol_list(raw: str) -> dict[str, Any]:
     symbols: list[dict[str, str]] = []
 
     for line in raw.split("\n"):
-        line = line.rstrip()
+        line = _clean_line(line)
         if not line.strip():
             continue
 
@@ -383,6 +394,33 @@ def parse_symbol_list(raw: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# parse_nearest_symbol — 解析 "ln" 最近符号输出
+# ---------------------------------------------------------------------------
+
+_RE_LN_SYMBOL = re.compile(
+    r"\((?P<address>[0-9a-f`]+)\)\s+(?P<symbol>\S+)",
+    re.IGNORECASE,
+)
+
+
+def parse_nearest_symbol(raw: str) -> dict[str, Any]:
+    """解析 'ln address' 输出，返回 {symbol: {address, name}}"""
+    if not raw or not raw.strip():
+        return _failback(raw)
+
+    m = _RE_LN_SYMBOL.search(raw)
+    if not m:
+        return _failback(raw)
+
+    return {
+        "symbol": {
+            "address": "0x" + m.group("address").replace("`", ""),
+            "name": m.group("symbol"),
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
 # parse_type_info — 解析 "dt" 类型信息
 # ---------------------------------------------------------------------------
 
@@ -399,7 +437,7 @@ def parse_type_info(raw: str) -> dict[str, Any]:
     fields: list[dict[str, str]] = []
 
     for line in raw.split("\n"):
-        line = line.rstrip()
+        line = _clean_line(line)
         if not line.strip():
             continue
 
@@ -417,6 +455,31 @@ def parse_type_info(raw: str) -> dict[str, Any]:
         return _failback(raw)
 
     return {"fields": fields}
+
+
+# ---------------------------------------------------------------------------
+# parse_evaluate — 解析 "? expression" 输出
+# ---------------------------------------------------------------------------
+
+_RE_EVAL = re.compile(
+    r"Evaluate expression:\s*(?P<decimal>-?\d+)\s*=\s*(?P<hex>[0-9a-f`]+)",
+    re.IGNORECASE,
+)
+
+
+def parse_evaluate(raw: str) -> dict[str, Any]:
+    """解析 '?' 表达式结果，返回 {decimal, hex}。"""
+    if not raw or not raw.strip():
+        return _failback(raw)
+
+    m = _RE_EVAL.search(raw)
+    if not m:
+        return _failback(raw)
+
+    return {
+        "decimal": int(m.group("decimal")),
+        "hex": "0x" + m.group("hex").replace("`", ""),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -547,3 +610,96 @@ def parse_process_list(raw: str) -> dict[str, Any]:
         return _failback(raw)
 
     return {"processes": processes}
+
+
+# ---------------------------------------------------------------------------
+# parse_thread_list_user — 解析 "~" 用户态线程列表
+# ---------------------------------------------------------------------------
+
+_RE_USER_THREAD = re.compile(
+    r"^(?P<markers>[.#* ]*)\s*(?P<id>\d+)\s+Id:\s*(?P<tid>[0-9a-f.`]+)"
+    r"\s+Suspend:\s*(?P<suspend>\d+)\s+Teb:\s*(?P<teb>[0-9a-f`]+)\s*(?P<state>.*)$",
+    re.IGNORECASE,
+)
+
+
+def parse_thread_list_user(raw: str) -> dict[str, Any]:
+    """解析用户态 '~' 输出，返回 {threads: [...]}。"""
+    if not raw or not raw.strip():
+        return _failback(raw)
+
+    threads: list[dict[str, Any]] = []
+
+    for line in raw.split("\n"):
+        line = _clean_line(line).strip()
+        if not line:
+            continue
+
+        m = _RE_USER_THREAD.match(line)
+        if not m:
+            continue
+
+        markers = m.group("markers") or ""
+        threads.append({
+            "id": m.group("id"),
+            "tid": m.group("tid").replace("`", ""),
+            "suspend": m.group("suspend"),
+            "teb": "0x" + m.group("teb").replace("`", ""),
+            "state": m.group("state").strip() or "Running",
+            "current": "." in markers,
+            "event": "#" in markers,
+        })
+
+    if not threads:
+        return _failback(raw)
+
+    return {"threads": threads}
+
+
+# ---------------------------------------------------------------------------
+# parse_breakpoints — 解析 "bl" 断点列表
+# ---------------------------------------------------------------------------
+
+_RE_BREAKPOINT = re.compile(
+    r"^\s*(?P<id>\d+)\s+(?P<state>[ed])\s+(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+_RE_BREAKPOINT_ADDR = re.compile(r"(?P<address>[0-9a-f`]{8,})", re.IGNORECASE)
+
+
+def parse_breakpoints(raw: str) -> dict[str, Any]:
+    """解析 'bl' 输出，返回 {breakpoints: [{id, enabled, address?, detail}]}。"""
+    if not raw or not raw.strip():
+        return _failback(raw)
+
+    breakpoints: list[dict[str, Any]] = []
+    meaningful_lines = 0
+
+    for line in raw.split("\n"):
+        line = _clean_line(line)
+        if not line.strip():
+            continue
+        meaningful_lines += 1
+
+        m = _RE_BREAKPOINT.match(line)
+        if not m:
+            continue
+
+        detail = m.group("rest").strip()
+        bp: dict[str, Any] = {
+            "id": m.group("id"),
+            "enabled": m.group("state").lower() == "e",
+            "detail": detail,
+        }
+        ma = _RE_BREAKPOINT_ADDR.search(detail)
+        if ma:
+            bp["address"] = "0x" + ma.group("address").replace("`", "")
+        breakpoints.append(bp)
+
+    if not breakpoints and meaningful_lines == 0:
+        return {"breakpoints": []}
+
+    if not breakpoints:
+        return _failback(raw)
+
+    return {"breakpoints": breakpoints}

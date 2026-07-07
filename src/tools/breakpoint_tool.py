@@ -1,11 +1,15 @@
 """断点管理工具。"""
 
+from typing import Literal
+
 from ._registry import _exec
+from ._parser import parse_breakpoints
+from ._response import is_error_output, make_error, make_response, next_action, parsed_response
 
 
 def register_breakpoint_tool(mcp):
     @mcp.tool()
-    def windbg_breakpoint(action: str, target: str = "", condition: str = "", id: str = "") -> str:
+    def windbg_breakpoint(action: Literal["set", "list", "clear", "enable", "disable"], target: str = "", condition: str = "", id: str = "") -> str:
         """管理断点。
 
         action 值:
@@ -25,28 +29,59 @@ def register_breakpoint_tool(mcp):
 
         if a == "set":
             if not target:
-                return "error: 'set' action requires 'target' parameter (address or symbol)"
+                return make_error("windbg_breakpoint", "", "invalid_argument", "'set' action requires 'target' parameter.")
             if condition:
-                return _exec(f'bp {target} "{condition}"')
-            return _exec(f"bp {target}")
+                command = f'bp {target} "{condition}"'
+            else:
+                command = f"bp {target}"
+            raw = _exec(command)
+            if is_error_output(raw):
+                return make_error("windbg_breakpoint", command, "debugger_error", raw.strip(), raw=raw)
+            return make_response(
+                "windbg_breakpoint",
+                command,
+                data={"action": "set", "target": target, "condition": condition or None, "status": "completed"},
+                raw=raw,
+                next_actions=[next_action("windbg_breakpoint", {"action": "list"}, "Confirm the breakpoint was installed.")],
+            )
 
         elif a == "list":
-            return _exec("bl")
+            command = "bl"
+            raw = _exec(command)
+            parsed = parse_breakpoints(raw)
+            return parsed_response("windbg_breakpoint", command, parsed, raw)
 
         elif a == "clear":
             if not id:
-                return "error: 'clear' action requires 'id' parameter (breakpoint number, or * for all)"
-            return _exec(f"bc {id}")
+                return make_error("windbg_breakpoint", "", "invalid_argument", "'clear' action requires 'id' parameter.")
+            command = f"bc {id}"
 
         elif a == "enable":
             if not id:
-                return "error: 'enable' action requires 'id' parameter"
-            return _exec(f"be {id}")
+                return make_error("windbg_breakpoint", "", "invalid_argument", "'enable' action requires 'id' parameter.")
+            command = f"be {id}"
 
         elif a == "disable":
             if not id:
-                return "error: 'disable' action requires 'id' parameter"
-            return _exec(f"bd {id}")
+                return make_error("windbg_breakpoint", "", "invalid_argument", "'disable' action requires 'id' parameter.")
+            command = f"bd {id}"
 
         else:
-            return f"error: unknown action '{action}' — valid: set, list, clear, enable, disable"
+            return make_error(
+                "windbg_breakpoint",
+                "",
+                "invalid_argument",
+                f"unknown action '{action}'; valid: set, list, clear, enable, disable",
+            )
+
+        raw = _exec(command)
+        if is_error_output(raw):
+            return make_error("windbg_breakpoint", command, "debugger_error", raw.strip(), raw=raw)
+
+        return make_response(
+            "windbg_breakpoint",
+            command,
+            data={"action": a, "id": id, "status": "completed"},
+            raw=raw,
+            next_actions=[next_action("windbg_breakpoint", {"action": "list"}, "Refresh the breakpoint list.")],
+        )
