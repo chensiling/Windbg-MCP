@@ -8,9 +8,12 @@ from ._parser import (
     parse_process_list,
     parse_registers,
     parse_stack_kp,
+    parse_thread_list_kernel,
     parse_thread_list_user,
 )
 from ._response import error_item, is_error_output, make_error, make_response, next_action
+
+_MODULE_LIMIT = 60
 
 
 def _detect_debug_mode(vertarget_raw: str) -> str:
@@ -79,14 +82,21 @@ def _split_sections(raw: str) -> tuple[str, str, str, str, str]:
 
 def register_context_tool(mcp):
     @mcp.tool()
-    def windbg_context(scope: Literal["default", "threads", "processes", "all"] = "default") -> str:
+    def windbg_context(
+        scope: Literal["default", "threads", "processes", "all"] = "default",
+        include_raw: bool = False,
+    ) -> str:
         """获取当前调试状态快照——一次调用，返回 LLM 最常用的全部上下文。
 
         scope 值:
-        - "default" (默认): 寄存器 + 当前指令 + 栈顶帧 + 最近事件 + 模块列表。
-        - "threads": default + 线程列表。
+        - "default" (默认): 寄存器 + 当前指令 + 栈顶帧 + 最近事件 + 模块摘要。
+        - "threads": default + 线程列表（内核态解析 !running -ti，用户态解析 ~）。
         - "processes": default + 内核进程列表。
         - "all": 全部信息。
+
+        include_raw:
+        - False (默认): 不在 envelope 中返回完整原始输出，模块列表按 top-N 截断，避免挤占上下文。
+        - True: 返回完整原始输出和完整模块列表，用于深度排查。
 
         返回统一 JSON envelope；结构化主结果在 data 字段中。
         """
@@ -155,7 +165,17 @@ def register_context_tool(mcp):
         parsed = parse_modules(modules_raw)
         if "raw" not in parsed:
             modules = parsed.get("modules", [])
-            data["modules"] = modules
+            data["module_count"] = len(modules)
+            if include_raw or len(modules) <= _MODULE_LIMIT:
+                data["modules"] = modules
+            else:
+                data["modules"] = modules[:_MODULE_LIMIT]
+                data["modules_truncated"] = True
+                errors.append(error_item(
+                    "output_truncated",
+                    f"Showing first {_MODULE_LIMIT} of {len(modules)} modules; call with include_raw=true for the full list.",
+                    recoverable=True,
+                ))
             data["symbol_health"] = _symbol_health(modules)
             if data["symbol_health"]["status"] in ("bad", "partial"):
                 actions.append(next_action("windbg_sympath", {"action": "set", "path": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"}, "Symbols appear incomplete; set a public symbol path before reloading."))
@@ -169,8 +189,17 @@ def register_context_tool(mcp):
                 thread_command = "!running -ti"
                 thread_raw = _exec(thread_command)
                 commands.append(thread_command)
-                data["threads_raw"] = thread_raw.strip()
-                actions.append(next_action("windbg_context", {"scope": "processes"}, "Use process context for kernel debugging; user-mode '~' thread parsing does not apply."))
+                parsed = parse_thread_list_kernel(thread_raw)
+                if "raw" not in parsed:
+                    data["processors"] = parsed.get("processors", [])
+                    if parsed.get("system_processors"):
+                        data["system_processors"] = parsed["system_processors"]
+                    if parsed.get("idle_processors"):
+                        data["idle_processors"] = parsed["idle_processors"]
+                else:
+                    data["threads_raw"] = thread_raw.strip()
+                    errors.append(error_item("parse_failed", "Could not parse kernel !running -ti output."))
+                    actions.append(next_action("windbg_context", {"scope": "processes"}, "Use process context for kernel debugging if thread parsing is unavailable."))
             else:
                 thread_command = "~"
                 thread_raw = _exec(thread_command)
@@ -203,7 +232,7 @@ def register_context_tool(mcp):
             commands,
             data=data,
             mode=mode,
-            raw=raw,
+            raw=raw if include_raw else "",
             errors=errors,
             next_actions=actions,
         )

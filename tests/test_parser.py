@@ -19,6 +19,7 @@ from tools._parser import (
     parse_analyze,
     parse_process_list,
     parse_thread_list_user,
+    parse_thread_list_kernel,
     parse_breakpoints,
 )
 
@@ -119,6 +120,37 @@ SAMPLE_BREAKPOINTS = """ 0 e Disable Clear  00007ff9`850bd78d     0001 (0001)  0
  1 d Disable Clear  00007ff9`850bd790     0001 (0001)  0:**** ntdll!Other"""
 
 SAMPLE_BREAKPOINTS_EMPTY = """0: kd> """
+
+SAMPLE_RUNNING_TI = """0: kd> 
+System Processors:  (000000000000000f)
+  Idle Processors:  (0000000000000008)
+
+       Prcbs             Current         (pri) Next            (pri) Idle
+  0    fffff80526ad6180  ffffda0273eea040 ( 8) ffffda02746490c0 (14) fffff80599bd15c0  ................
+
+ # Child-SP          RetAddr               Call Site
+00 ffff968b`f8207708 fffff805`2d9c18d0     nt!DbgBreakPointWithStatus
+01 ffff968b`f8207710 fffff805`2d9c1718     kdnic!TXTransmitQueuedSends+0x180
+02 ffff968b`f82077a0 fffff805`2d9c20b7     kdnic!HandleSend+0x228
+
+  1    ffffaa80efed1180  ffffda02717a4080 ( 0) ffffda0274f6b080 ( 8) ffffda02717a4080  ................
+
+ # Child-SP          RetAddr               Call Site
+00 ffff968b`f7a4f960 fffff805`992d9e48     nt!PpmIdleGuestExecute+0x15
+01 ffff968b`f7a4f9a0 fffff805`990414a0     nt!PpmIdleExecuteTransition+0x36f7f4
+
+  2    ffffaa80eff6d180  ffffda0274ec60c0 ( 8)                       ffffda0271844280  ................
+
+ # Child-SP          RetAddr               Call Site
+00 ffff968b`fa25f118 fffff805`98fe2dd6     nt!HalpApic1WriteIcr+0x39
+01 ffff968b`fa25f120 fffff805`98e53761     nt!HalpApicRequestInterrupt+0x96
+
+  3    ffffaa80efdc2180  ffffda0271853280 ( 0)                       ffffda0271853280  ................
+
+ # Child-SP          RetAddr               Call Site
+00 ffff968b`f7a8f960 fffff805`992d9e48     nt!PpmIdleGuestExecute+0x15
+01 ffff968b`f7a8f9a0 fffff805`990414a0     nt!PpmIdleExecuteTransition+0x36f7f4
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +371,40 @@ class TestParseBreakpoints:
         assert result["breakpoints"] == []
 
 
+class TestParseThreadListKernel:
+    def test_parse(self):
+        result = parse_thread_list_kernel(SAMPLE_RUNNING_TI)
+        assert result["system_processors"] == "0x000000000000000f"
+        assert result["idle_processors"] == "0x0000000000000008"
+        procs = result["processors"]
+        assert len(procs) == 4
+
+        p0 = procs[0]
+        assert p0["processor"] == 0
+        assert p0["prcb"] == "0xfffff80526ad6180"
+        assert p0["current_thread"] == "0xffffda0273eea040"
+        assert p0["current_pri"] == 8
+        assert p0["next_thread"] == "0xffffda02746490c0"
+        assert p0["next_pri"] == 14
+        assert p0["idle_thread"] == "0xfffff80599bd15c0"
+        assert len(p0["stack"]) == 3
+        assert p0["stack"][0]["index"] == "00"
+        assert p0["stack"][0]["child_sp"] == "0xffff968bf8207708"
+        assert p0["stack"][0]["call_site"] == "nt!DbgBreakPointWithStatus"
+
+    def test_processor_without_next(self):
+        result = parse_thread_list_kernel(SAMPLE_RUNNING_TI)
+        p2 = result["processors"][2]
+        assert "next_thread" not in p2
+        assert "next_pri" not in p2
+        assert p2["current_thread"] == "0xffffda0274ec60c0"
+        assert p2["idle_thread"] == "0xffffda0271844280"
+
+    def test_empty(self):
+        result = parse_thread_list_kernel("user mode output")
+        assert result["raw"] == "user mode output"
+
+
 class TestFailback:
     """所有解析器失败时必须返回 {"raw": ...} 而不是抛异常"""
 
@@ -348,7 +414,7 @@ class TestFailback:
             parse_disassembly, parse_memory_dump, parse_modules,
             parse_symbol_list, parse_nearest_symbol, parse_type_info,
             parse_evaluate, parse_analyze, parse_process_list,
-            parse_thread_list_user, parse_breakpoints,
+            parse_thread_list_user, parse_thread_list_kernel, parse_breakpoints,
         ]
         for parser in parsers:
             result = parser("")
@@ -360,7 +426,7 @@ class TestFailback:
             parse_disassembly, parse_memory_dump, parse_modules,
             parse_symbol_list, parse_nearest_symbol, parse_type_info,
             parse_evaluate, parse_analyze, parse_process_list,
-            parse_thread_list_user, parse_breakpoints,
+            parse_thread_list_user, parse_thread_list_kernel, parse_breakpoints,
         ]
         garbage = "!@#$%^&*()_+\nnothing\n12345\n"
         for parser in parsers:

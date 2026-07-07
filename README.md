@@ -58,33 +58,53 @@ python -m src.server --standalone --pid 1234
 python -m src.server --standalone --dump crash.dmp
 ```
 
-默认 MCP HTTP 地址：
+## 接入 AGENT 工具（MCP 客户端）
+
+本服务通过 streamable HTTP 暴露标准 MCP 接口，任何支持 MCP 的 AGENT 工具（如 Codex、Claude、Cline、Continue 等）都可以接入，方式取决于各自的配置格式。核心只有一个：把 MCP 客户端指向服务的 HTTP 端点。
+
+默认端点：
 
 ```text
 http://127.0.0.1:8080/mcp
 ```
 
-## Codex MCP 配置
+不同客户端的配置示例：
 
-在全局 Codex 配置 `%USERPROFILE%\.codex\config.toml` 中加入：
+- Codex（`%USERPROFILE%\.codex\config.toml`）：
 
-```toml
-[mcp_servers.windbg]
-url = "http://127.0.0.1:8080/mcp"
-```
+  ```toml
+  [mcp_servers.windbg]
+  url = "http://127.0.0.1:8080/mcp"
+  ```
 
-修改 MCP 配置后需要重启 Codex。调用工具前，Windbg-MCP 服务本身也必须已经启动。
+- 通用 JSON 风格客户端（`mcpServers` 字段，字段名以各工具文档为准）：
+
+  ```json
+  {
+    "mcpServers": {
+      "windbg": {
+        "url": "http://127.0.0.1:8080/mcp"
+      }
+    }
+  }
+  ```
+
+注意事项：
+
+- 端口可通过 `--http-port` 或环境变量 `WINDBG_MCP_HTTP_PORT` 修改，配置中的 URL 需同步更新。
+- 修改 MCP 配置后通常需要重启对应的 AGENT 工具，使其重新发现工具列表。
+- 调用工具前，Windbg-MCP 服务本身必须已经启动并连接到调试目标。
 
 ## 返回格式
 
-除 `windbg_exec` 外，所有业务工具都会返回 JSON 字符串，格式如下：
+除 `windbg_exec` 外，所有业务工具都返回统一的 JSON envelope 字符串，字段结构一致，与具体工具无关：
 
 ```json
 {
   "ok": true,
-  "tool": "windbg_context",
-  "command": "r",
-  "mode": "kernel",
+  "tool": "<工具名>",
+  "command": "<实际发送给 cdb.exe 的命令，可为字符串或字符串数组>",
+  "mode": "kernel | user | dump | unknown",
   "data": {},
   "raw": "",
   "errors": [],
@@ -92,7 +112,18 @@ url = "http://127.0.0.1:8080/mcp"
 }
 ```
 
-使用时优先读取 `data`。只有解析失败或需要更多细节时，再查看 `raw`。`next_actions` 是工具根据当前状态给出的建议后续调用。
+字段说明：
+
+- `ok`：命令是否成功执行。解析失败但 `raw` 可用时仍可为 `true`，并在 `errors` 中记录解析警告。
+- `tool`：产生该结果的工具名，便于在长上下文里追踪来源。
+- `command`：实际执行的 WinDbg 命令；组合工具（如 `windbg_context`、`windbg_analyze`）可能返回命令数组。
+- `mode`：调试模式，至少区分 `kernel` / `user` / `dump` / `unknown`。
+- `data`：结构化主结果，不同工具字段不同——例如寄存器、调用栈帧、内存、符号、断点列表等。**优先读取这个字段。**
+- `raw`：原始输出兜底。解析失败、部分失败或显式请求（如 `include_raw`）时保留。
+- `errors`：结构化错误数组，形如 `{code, message, recoverable}`。
+- `next_actions`：工具基于当前状态给出的推荐后续调用，形如 `{tool, args, reason}`。
+
+只有解析失败或需要更多细节时才查看 `raw`。`next_actions` 是建议而非强制，供 LLM 参考。
 
 ## 推荐 LLM 调用流程
 
@@ -114,7 +145,7 @@ url = "http://127.0.0.1:8080/mcp"
 
 | 工具 | 用途 | 说明 |
 |---|---|---|
-| `windbg_context(scope?)` | 当前调试状态 | 调试入口工具。`scope` 支持 `default`、`threads`、`processes`、`all`。返回寄存器、当前指令、栈顶帧、最近事件、模块、符号健康状态和调试模式。内核模式下 `threads` 使用 `!running -ti`，目前返回 `threads_raw`。 |
+| `windbg_context(scope?, include_raw?)` | 当前调试状态 | 调试入口工具。`scope` 支持 `default`、`threads`、`processes`、`all`。返回寄存器、当前指令、栈顶帧、最近事件、模块摘要、符号健康状态和调试模式。内核模式下 `threads` 使用 `!running -ti` 并解析为 `processors`（含每处理器 `current_thread`/`next_thread`/`idle_thread`/`stack`）；用户态使用 `~` 解析线程列表。`include_raw=false`（默认）时模块列表按 top-N 截断且不返回完整原始输出，`include_raw=true` 返回完整模块列表和原始输出。 |
 | `windbg_analyze(scope?)` | 崩溃/挂起分析 | `scope` 支持 `quick`、`crash`、`hang`。`crash` 会额外收集寄存器和调用栈。 |
 | `windbg_backtrace(depth?, show_params?, frame?)` | 调用栈 | 解析 `kP`/`k` 输出，支持带帧号的内核调用栈。 |
 | `windbg_disassemble(at, count?)` | 反汇编 | 解析 `u` 输出和符号标签。`count` 支持十进制、`0x` 十六进制和 `10h` 形式。 |

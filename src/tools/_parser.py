@@ -703,3 +703,99 @@ def parse_breakpoints(raw: str) -> dict[str, Any]:
         return _failback(raw)
 
     return {"breakpoints": breakpoints}
+
+
+# ---------------------------------------------------------------------------
+# parse_thread_list_kernel — 解析内核 "!running -ti" 输出
+# ---------------------------------------------------------------------------
+
+_RE_SYS_PROCESSORS = re.compile(
+    r"System Processors:\s*\((?P<mask>[0-9a-f`]+)\)", re.IGNORECASE
+)
+_RE_IDLE_PROCESSORS = re.compile(
+    r"Idle Processors:\s*\((?P<mask>[0-9a-f`]+)\)", re.IGNORECASE
+)
+_RE_PRCB_HEADER = re.compile(r"Prcbs\s+Current", re.IGNORECASE)
+_RE_RUNNING_ROW = re.compile(
+    r"^\s*(?P<proc>\d+)\s+(?P<prcb>[0-9a-f`]+)\s+"
+    r"(?P<current>[0-9a-f`]+)\s*\(\s*(?P<curpri>\d+)\s*\)"
+    r"(?:\s+(?P<next>[0-9a-f`]+)\s*\(\s*(?P<nextpri>\d+)\s*\))?"
+    r"\s+(?P<idle>[0-9a-f`]+)",
+    re.IGNORECASE,
+)
+
+
+def _hex0x(value: str) -> str:
+    return "0x" + value.replace("`", "")
+
+
+def parse_thread_list_kernel(raw: str) -> dict[str, Any]:
+    """解析内核 '!running -ti' 输出。
+
+    返回 {system_processors?, idle_processors?, processors: [
+        {processor, prcb, current_thread, current_pri, next_thread?, next_pri?,
+         idle_thread, stack: [{index, child_sp, ret_addr, call_site}]}
+    ]}
+    """
+    if not raw or not raw.strip():
+        return _failback(raw)
+
+    result: dict[str, Any] = {}
+    processors: list[dict[str, Any]] = []
+    current_proc: dict[str, Any] | None = None
+
+    for line in raw.split("\n"):
+        line = _clean_line(line)
+        if not line.strip():
+            continue
+
+        m = _RE_SYS_PROCESSORS.search(line)
+        if m:
+            result["system_processors"] = _hex0x(m.group("mask"))
+            continue
+
+        m = _RE_IDLE_PROCESSORS.search(line)
+        if m:
+            result["idle_processors"] = _hex0x(m.group("mask"))
+            continue
+
+        if _RE_PRCB_HEADER.search(line):
+            continue
+
+        if _RE_STACK_HEADER.search(line):
+            continue
+
+        m = _RE_RUNNING_ROW.match(line)
+        if m:
+            current_proc = {
+                "processor": int(m.group("proc")),
+                "prcb": _hex0x(m.group("prcb")),
+                "current_thread": _hex0x(m.group("current")),
+                "current_pri": int(m.group("curpri")),
+                "idle_thread": _hex0x(m.group("idle")),
+                "stack": [],
+            }
+            if m.group("next"):
+                current_proc["next_thread"] = _hex0x(m.group("next"))
+                current_proc["next_pri"] = int(m.group("nextpri"))
+            processors.append(current_proc)
+            continue
+
+        if current_proc is not None:
+            ms = _RE_STACK_LINE.match(line)
+            if ms:
+                frame: dict[str, str] = {
+                    "child_sp": "0x" + ms.group("child_sp").replace("`", ""),
+                    "ret_addr": "0x" + ms.group("ret_addr").replace("`", ""),
+                    "call_site": ms.group("call_site").strip(),
+                }
+                if ms.group("index") is not None:
+                    frame["index"] = ms.group("index")
+                current_proc["stack"].append(frame)
+                continue
+
+    if not processors:
+        return _failback(raw)
+
+    result["processors"] = processors
+    return result
