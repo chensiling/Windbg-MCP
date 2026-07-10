@@ -1,105 +1,251 @@
-"""符号路径管理工具。"""
+"""Symbol path management and symbol-state observations."""
 
+import re
 from typing import Literal
 
-from ._registry import _exec
+from ._evidence import run_mutation, run_read
+from ._models import ToolEnvelope
 from ._parser import parse_modules
-from ._response import is_error_output, make_error, make_response, next_action, parsed_response
+from ._response import (
+    error_item,
+    inference_item,
+    make_response,
+    validate_intent_text,
+)
+
+
+SympathAction = Literal["show", "set", "reload", "check"]
 
 
 def _symbol_health(modules: list[dict[str, str]]) -> dict[str, object]:
-    if not modules:
-        return {"status": "unknown", "missing_modules": []}
-
     missing = []
+    deferred = []
     partial = []
-    for mod in modules:
-        info = mod.get("info", "").lower()
-        if "deferred" in info or "no symbols" in info:
-            missing.append(mod.get("name", ""))
+    for module in modules:
+        info = module.get("info", "").lower()
+        name = module.get("name", "")
+        if "no symbols" in info:
+            missing.append(name)
+        elif "deferred" in info:
+            deferred.append(name)
         elif "export symbols" in info:
-            partial.append(mod.get("name", ""))
-
+            partial.append(name)
     if missing:
         status = "bad" if len(missing) == len(modules) else "partial"
     elif partial:
         status = "partial"
-    else:
+    elif deferred:
+        status = "deferred"
+    elif modules:
         status = "good"
-
+    else:
+        status = "unknown"
     return {
         "status": status,
-        "missing_modules": [m for m in missing if m],
-        "partial_modules": [m for m in partial if m],
+        "missing_modules": [name for name in missing if name],
+        "deferred_modules": [name for name in deferred if name],
+        "partial_modules": [name for name in partial if name],
     }
+
+
+def _health_inference(modules):
+    return inference_item(
+        "symbol_health",
+        _symbol_health(modules),
+        "derived from the symbol-state text reported for each module",
+    )
+
+
+def _validate_symbol_path(path: str):
+    if not path.strip():
+        return error_item("invalid_argument", "'path' is required.")
+    if any(character in path for character in ('"', "\r", "\n", "\x00")):
+        return error_item(
+            "unsafe_argument",
+            "'path' contains an unsafe quote or newline.",
+            recoverable=False,
+        )
+    for segment in path.split(";"):
+        value = segment.strip()
+        if not value:
+            return error_item("invalid_argument", "Symbol path segments cannot be empty.")
+        allowed = (
+            value.lower().startswith(("srv*", "cache*", "symsrv*", "http://", "https://"))
+            or bool(re.match(r"^[a-zA-Z]:\\", value))
+            or value.startswith("\\\\")
+        )
+        if not allowed:
+            return error_item(
+                "unsafe_argument",
+                f"Unsupported symbol path segment: {value}",
+                recoverable=False,
+            )
+    return None
+
+
+def _normalize_symbol_path(path: str) -> str:
+    return ";".join(
+        segment.strip().rstrip("\\/").casefold()
+        for segment in path.split(";")
+    )
+
+
+def _reported_symbol_paths(raw: str) -> list[str]:
+    paths = []
+    for line in raw.splitlines():
+        label, separator, value = line.partition(":")
+        if separator and "symbol search path" in label.casefold() and value.strip():
+            paths.append(value.strip())
+    return paths
 
 
 def register_sympath_tool(mcp):
     @mcp.tool()
-    def windbg_sympath(action: Literal["show", "set", "reload", "check"], path: str = "", module: str = "") -> str:
-        """管理调试符号路径——不需要记忆 WinDbg 语法。
+    def windbg_sympath(
+        action: SympathAction,
+        path: str = "",
+        module: str = "",
+    ) -> ToolEnvelope:
+        """Show, set, reload, or inspect debugger symbol configuration."""
 
-        action 值:
-        - "show": 显示当前符号路径。无需其他参数。
-        - "set": 设置符号路径。需要 path（符号服务器或本地路径）。
-        - "reload": 重载符号。可选 module 指定模块名，不指定则重载全部。
-        - "check": 检查模块符号加载状态。可选 module 过滤。
-
-        Microsoft 公共符号服务器:
-        https://msdl.microsoft.com/download/symbols
-        """
-        a = action.lower().strip()
-
-        if a == "show":
-            command = ".sympath"
-            raw = _exec(command)
-            if is_error_output(raw):
-                return make_error("windbg_sympath", command, "debugger_error", raw.strip(), raw=raw)
-            return make_response("windbg_sympath", command, data={"sympath_raw": raw.strip()}, raw=raw)
-
-        if a == "set":
-            if not path:
-                return make_error(
+        normalized = action.lower().strip()
+        if normalized not in ("show", "set", "reload", "check"):
+            return make_response(
+                "windbg_sympath",
+                errors=[error_item("invalid_argument", "Unknown symbol-path action.")],
+                verification_status="not_run",
+            )
+        if path and normalized != "set":
+            path_error = _validate_symbol_path(path)
+            if path_error:
+                return make_response(
                     "windbg_sympath",
-                    "",
-                    "invalid_argument",
-                    "'set' action requires 'path'. Example: srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
+                    errors=[path_error],
+                    verification_status="not_run",
                 )
-            command = f".sympath {path}"
-            raw = _exec(command)
-            if is_error_output(raw):
-                return make_error("windbg_sympath", command, "debugger_error", raw.strip(), raw=raw)
+        module_error = validate_intent_text(module, "module", required=False)
+        if module and not re.fullmatch(r"[A-Za-z0-9_.?*-]+", module):
+            module_error = error_item(
+                "unsafe_argument",
+                "'module' contains unsupported characters.",
+                recoverable=False,
+            )
+        if module_error:
             return make_response(
                 "windbg_sympath",
-                command,
-                data={"action": "set", "path": path, "status": "completed"},
-                raw=raw,
-                next_actions=[next_action("windbg_sympath", {"action": "reload"}, "Reload symbols after changing the symbol path.")],
+                errors=[module_error],
+                verification_status="not_run",
             )
 
-        if a == "reload":
-            command = f".reload /f {module}" if module else ".reload /f"
-            raw = _exec(command)
-            if is_error_output(raw):
-                return make_error("windbg_sympath", command, "debugger_error", raw.strip(), raw=raw)
+        if normalized == "show":
+            evidence = run_read(".sympath")
             return make_response(
                 "windbg_sympath",
-                command,
-                data={"action": "reload", "module": module or None, "status": "completed"},
-                raw=raw,
-                next_actions=[next_action("windbg_sympath", {"action": "check", "module": module} if module else {"action": "check"}, "Check symbol load status after reload.")],
+                [evidence.source],
+                {"sympath": evidence.execution.output.strip()},
             )
 
-        if a == "check":
-            command = f"lm m {module}" if module else "lm"
-            raw = _exec(command)
-            parsed = parse_modules(raw)
-            if "raw" not in parsed:
-                data = {**parsed, "symbol_health": _symbol_health(parsed.get("modules", []))}
-                actions = []
-                if data["symbol_health"]["status"] in ("bad", "partial"):
-                    actions.append(next_action("windbg_sympath", {"action": "set", "path": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"}, "Set a public symbol path before reloading missing symbols."))
-                return parsed_response("windbg_sympath", command, parsed, raw, data=data, next_actions=actions)
-            return parsed_response("windbg_sympath", command, parsed, raw)
+        if normalized == "set":
+            path_error = _validate_symbol_path(path)
+            if path_error:
+                return make_response(
+                    "windbg_sympath",
+                    errors=[path_error],
+                    verification_status="not_run",
+                )
+            mutation = run_mutation(f".sympath {path}")
+            sources = [mutation.source]
+            data = {"requested_path": path}
+            if mutation.execution.status != "completed":
+                return make_response(
+                    "windbg_sympath",
+                    sources,
+                    data,
+                    verification_status="indeterminate",
+                )
+            query = run_read(".sympath")
+            sources.append(query.source)
+            data["sympath"] = query.execution.output.strip()
+            reported_paths = _reported_symbol_paths(query.execution.output)
+            data["reported_paths"] = reported_paths
+            query_complete = (
+                query.execution.status == "completed"
+                and query.execution.complete
+            )
+            verified = query_complete and any(
+                _normalize_symbol_path(reported) == _normalize_symbol_path(path)
+                for reported in reported_paths
+            )
+            if not query_complete or not reported_paths:
+                verification_status = "indeterminate"
+                errors = [error_item(
+                    "verification_indeterminate",
+                    "The effective symbol path query did not complete with a path.",
+                    stage="verification",
+                )]
+            elif not verified:
+                verification_status = "failed"
+                errors = [error_item(
+                    "verification_failed",
+                    "The effective symbol path did not equal the requested path.",
+                    recoverable=False,
+                    stage="verification",
+                )]
+            else:
+                verification_status = "verified"
+                errors = []
+            return make_response(
+                "windbg_sympath",
+                sources,
+                data,
+                verification_status=verification_status,
+                errors=errors,
+            )
 
-        return make_error("windbg_sympath", "", "invalid_argument", "unknown action; valid: show, set, reload, check")
+        command = f"lm m {module}" if module else "lm"
+        if normalized == "reload":
+            reload_command = f".reload /f {module}" if module else ".reload /f"
+            mutation = run_mutation(reload_command)
+            sources = [mutation.source]
+            if mutation.execution.status != "completed":
+                return make_response(
+                    "windbg_sympath",
+                    sources,
+                    {"module": module or None},
+                    verification_status="indeterminate",
+                )
+        else:
+            sources = []
+
+        query = run_read(command, parse_modules)
+        sources.append(query.source)
+        modules = (
+            list(query.parsed.data.get("modules", []))
+            if query.parsed is not None
+            else []
+        )
+        query_observed = (
+            query.execution.status == "completed"
+            and query.parsed is not None
+            and query.parsed.status == "complete"
+        )
+        verification_status = (
+            "verified" if normalized == "reload" and query_observed
+            else "failed" if normalized == "reload"
+            else "not_required"
+        )
+        verification_errors = []
+        if normalized == "reload" and not query_observed:
+            verification_errors.append(error_item(
+                "verification_failed",
+                "Module state could not be observed after symbol reload.",
+                stage="verification",
+            ))
+        return make_response(
+            "windbg_sympath",
+            sources,
+            {"module": module or None, "modules": modules},
+            inferences=[_health_inference(modules)],
+            verification_status=verification_status,
+            errors=verification_errors,
+        )

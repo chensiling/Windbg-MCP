@@ -1,78 +1,98 @@
-"""符号/类型查找工具 — 统一入口，自动识别意图。"""
+"""Explicit symbol, type, and address lookup tool."""
 
 import re
+from typing import Literal
 
-from ._registry import _exec
+from ._evidence import resolve_expression, run_read
+from ._models import ToolEnvelope
 from ._parser import parse_nearest_symbol, parse_symbol_list, parse_type_info
-from ._response import make_response, next_action, parsed_response
+from ._response import (
+    error_item,
+    inference_item,
+    make_response,
+    next_action,
+    validate_intent_text,
+)
+
+
+LookupKind = Literal["auto", "address", "symbol", "type"]
+
+
+def _auto_route(value: str) -> tuple[str, str]:
+    cleaned = value.replace("`", "").lower()
+    if (
+        cleaned.startswith("0x")
+        and re.fullmatch(r"0x[0-9a-f]+", cleaned)
+    ) or re.fullmatch(r"[0-9a-f]{8,}", cleaned):
+        return "address", "input is a hexadecimal address"
+    if value.startswith("@") or value.lower().startswith(("poi(", "dwo(", "qwo(")):
+        return "address", "input is a debugger address expression"
+    if "*" in value or "?" in value:
+        return "symbol", "input contains a symbol wildcard"
+    basename = value.rsplit("!", 1)[-1]
+    if basename.startswith("_") and basename[1:].upper() == basename[1:]:
+        return "type", "input matches a conventional debugger type name"
+    return "symbol", "default symbol-search route"
 
 
 def register_lookup_tool(mcp):
     @mcp.tool()
-    def windbg_lookup(what: str) -> str:
-        """根据输入自动识别并执行符号、类型或地址解析。
+    def windbg_lookup(what: str, kind: LookupKind = "auto") -> ToolEnvelope:
+        """Look up an address, symbol pattern, or type using an explicit route."""
 
-        自动识别规则：
-        - 纯十六进制地址（如 0x7ff... 或 00007ff9`850bd78d）→ 用 'ln' 查找最近的符号。
-        - 包含通配符 * 或 ?（如 ntdll!*CreateFile*）→ 用 'x' 搜索符号。
-        - 以 ! 结尾或以 _ 开头的大写名（如 ntdll!_TEB、_EPROCESS）→ 用 'dt' 显示类型。
-        - 其他 → 按符号搜索。
-
-        参数 what: 地址、符号模式或类型名。
-
-        返回结构化结果：
-        - 地址解析: {symbol: {name, displacement}}
-        - 符号搜索: {symbols: [{address, name}]}
-        - 类型信息: {fields: [{offset, name, type}]}
-        解析失败时返回原始文本。
-        """
-        w = what.strip()
-        if not w:
+        input_error = validate_intent_text(what, "what")
+        if input_error:
+            return make_response("windbg_lookup", errors=[input_error])
+        requested_kind = kind.lower().strip()
+        if requested_kind not in ("auto", "address", "symbol", "type"):
             return make_response(
                 "windbg_lookup",
-                "",
-                ok=False,
-                errors=[{"code": "invalid_argument", "message": "'what' is required.", "recoverable": True}],
+                errors=[error_item(
+                    "invalid_argument",
+                    "'kind' must be auto, address, symbol, or type.",
+                )],
             )
 
-        # 纯十六进制地址 → ln
-        cleaned = w.replace("`", "").lower()
-        is_hex_address = (
-            (cleaned.startswith("0x") and all(c in "0123456789abcdefx" for c in cleaned))
-            or bool(re.fullmatch(r"[0-9a-f]{8,}", cleaned))
+        inferences = []
+        route = requested_kind
+        if route == "auto":
+            route, basis = _auto_route(what.strip())
+            inferences.append(inference_item("lookup_routing", route, basis))
+
+        data = {"input": what, "kind": route}
+        if route == "address":
+            resolution, resolved_address = resolve_expression(what)
+            sources = [resolution.source]
+            if resolved_address is None:
+                return make_response(
+                    "windbg_lookup",
+                    sources,
+                    data,
+                    inferences=inferences,
+                )
+            data["resolved_address"] = resolved_address
+            evidence = run_read(f"ln {resolved_address}", parse_nearest_symbol)
+            sources.append(evidence.source)
+        elif route == "symbol":
+            evidence = run_read(f"x {what.strip()}", parse_symbol_list)
+            sources = [evidence.source]
+        else:
+            evidence = run_read(f"dt {what.strip()}", parse_type_info)
+            sources = [evidence.source]
+
+        if evidence.parsed is not None:
+            data.update(dict(evidence.parsed.data))
+        actions = []
+        if route == "symbol" and len(data.get("symbols", [])) > 50:
+            actions.append(next_action(
+                "windbg_lookup",
+                {"what": what, "kind": "symbol"},
+                "Narrow the symbol pattern to reduce matches.",
+            ))
+        return make_response(
+            "windbg_lookup",
+            sources,
+            data,
+            inferences=inferences,
+            next_actions=actions,
         )
-        if is_hex_address:
-            command = f"ln {w}"
-            raw = _exec(command)
-            parsed = parse_nearest_symbol(raw)
-            return parsed_response("windbg_lookup", command, parsed, raw, data={**parsed, "kind": "address"} if "raw" not in parsed else None)
-
-        # 包含通配符 → x
-        if "*" in w or "?" in w:
-            command = f"x {w}"
-            raw = _exec(command)
-            parsed = parse_symbol_list(raw)
-            actions = []
-            if "raw" not in parsed and len(parsed.get("symbols", [])) > 50:
-                actions.append(next_action("windbg_lookup", {"what": w.replace("*", "") + "*"}, "Too many matches; narrow the symbol pattern."))
-            return parsed_response("windbg_lookup", command, parsed, raw, data={**parsed, "kind": "symbol_search"} if "raw" not in parsed else None, next_actions=actions)
-
-        # 以 _ 开头的大写名或包含 ! 的已知类型 → dt
-        if (w[0] == "_" and w[1:].upper() == w[1:]) or "!" in w:
-            # 尝试 dt
-            command = f"dt {w}"
-            raw = _exec(command)
-            parsed = parse_type_info(raw)
-            if "raw" in parsed:
-                # dt 失败，尝试 x
-                command2 = f"x {w}"
-                raw2 = _exec(command2)
-                parsed2 = parse_symbol_list(raw2)
-                return parsed_response("windbg_lookup", [command, command2], parsed2, raw2, data={**parsed2, "kind": "symbol_search"} if "raw" not in parsed2 else None)
-            return parsed_response("windbg_lookup", command, parsed, raw, data={**parsed, "kind": "type"} if "raw" not in parsed else None)
-
-        # 默认：按符号搜索
-        command = f"x {w}"
-        raw = _exec(command)
-        parsed = parse_symbol_list(raw)
-        return parsed_response("windbg_lookup", command, parsed, raw, data={**parsed, "kind": "symbol_search"} if "raw" not in parsed else None)

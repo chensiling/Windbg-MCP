@@ -1,81 +1,197 @@
-"""内存读写工具。"""
+"""Memory read and verified byte-write tools."""
 
+import re
 from typing import Literal
 
-from ._registry import _exec
+from ._evidence import resolve_expression, run_mutation, run_read
+from ._models import ToolEnvelope
 from ._parser import parse_memory_dump
-from ._response import is_error_output, make_error, make_response, next_action, parse_int_arg, parsed_response
+from ._response import (
+    error_item,
+    make_response,
+    parse_int_arg,
+    validate_intent_text,
+)
+
+
+MemoryFormat = Literal[
+    "auto", "byte", "b", "word", "w", "dword", "d",
+    "qword", "q", "ascii", "a",
+]
+_FORMAT_COMMAND = {
+    "auto": "d",
+    "byte": "b",
+    "b": "b",
+    "word": "w",
+    "w": "w",
+    "dword": "d",
+    "d": "d",
+    "qword": "q",
+    "q": "q",
+    "ascii": "a",
+    "a": "a",
+}
+
+
+def _parse_byte_values(values: str) -> tuple[list[str], object | None]:
+    tokens = values.split()
+    if not tokens:
+        return [], error_item("invalid_argument", "'values' is required.")
+    if len(tokens) > 0x400:
+        return [], error_item(
+            "invalid_argument",
+            "'values' cannot contain more than 1024 bytes.",
+        )
+    parsed = []
+    for token in tokens:
+        if not re.fullmatch(r"(?:0x)?[0-9a-fA-F]{1,2}", token):
+            return [], error_item(
+                "invalid_argument",
+                "'values' must contain space-separated byte values.",
+            )
+        parsed.append(f"0x{int(token, 16):02x}")
+    return parsed, None
 
 
 def register_memory_tool(mcp):
     @mcp.tool()
-    def windbg_read_memory(address: str, size: str = "0x20", format: Literal["auto", "byte", "b", "word", "w", "dword", "d", "qword", "q", "ascii", "a"] = "auto") -> str:
-        """读取指定地址的内存。
+    def windbg_read_memory(
+        address: str,
+        size: str = "0x20",
+        format: MemoryFormat = "auto",
+    ) -> ToolEnvelope:
+        """Resolve an address and return a bounded parsed memory observation."""
 
-        address: 起始地址（支持 @rip, @rsp+0x20, 0x..., 符号名）。
-        size: 读取元素数量，默认 0x20。
-        format: 数据格式——
-          "byte" 或 "b": 字节 (db)
-          "word" 或 "w": 字 (dw)
-          "dword" 或 "d": 双字 (dd)
-          "qword" 或 "q": 四字 (dq)
-          "ascii" 或 "a": ASCII 字符串 (da)
-          "auto" 或未指定: 用 dd 读取（最常用）
-
-        返回结构化数据：address, format, data[{offset, value, ascii?}]。
-        """
-        fmt_map = {"byte": "b", "word": "w", "dword": "d", "qword": "q", "ascii": "a", "auto": "d"}
-        f = fmt_map.get(format.lower(), format.lower())
-        if f not in ("b", "w", "d", "q", "a"):
-            return make_error(
+        input_error = validate_intent_text(address, "address")
+        if input_error:
+            return make_response("windbg_read_memory", errors=[input_error])
+        normalized_format = format.lower().strip()
+        if normalized_format not in _FORMAT_COMMAND:
+            return make_response(
                 "windbg_read_memory",
-                "",
-                "invalid_argument",
-                "format must be one of auto, byte, word, dword, qword, ascii.",
+                errors=[error_item(
+                    "invalid_argument",
+                    "'format' must be auto, byte, word, dword, qword, or ascii.",
+                )],
             )
-
-        n, arg_error = parse_int_arg(size, "size", default=0x20, min_value=1, max_value=0x400)
-        if arg_error:
-            return make_response("windbg_read_memory", "", ok=False, errors=[arg_error])
-
-        command = f"d{f} {address} L{n:x}"
-        raw = _exec(command)
-        parsed = parse_memory_dump(raw)
-        actions = []
-        if "raw" in parsed and not is_error_output(raw):
-            actions.append(next_action("windbg_evaluate", {"expression": address}, "Validate the address expression before reading memory again."))
-        return parsed_response(
-            "windbg_read_memory",
-            command,
-            parsed,
-            raw,
-            data={**parsed, "requested_address": address, "requested_format": format, "requested_size": n} if "raw" not in parsed else None,
-            next_actions=actions,
+        size_value, size_error = parse_int_arg(
+            size,
+            "size",
+            default=0x20,
+            min_value=1,
+            max_value=0x400,
         )
+        if size_error:
+            return make_response("windbg_read_memory", errors=[size_error])
+
+        resolution, resolved_address = resolve_expression(address)
+        sources = [resolution.source]
+        data = {
+            "input": address,
+            "requested_format": normalized_format,
+            "requested_size": size_value,
+        }
+        if resolved_address is None:
+            return make_response("windbg_read_memory", sources, data)
+        data["resolved_address"] = resolved_address
+
+        read = run_read(
+            f"d{_FORMAT_COMMAND[normalized_format]} {resolved_address} L0n{size_value}",
+            parse_memory_dump,
+        )
+        sources.append(read.source)
+        if read.parsed is not None:
+            data.update(dict(read.parsed.data))
+        return make_response("windbg_read_memory", sources, data)
 
     @mcp.tool()
-    def windbg_write_memory(address: str, values: str) -> str:
-        """写入内存。
+    def windbg_write_memory(address: str, values: str) -> ToolEnvelope:
+        """Write bytes and verify the postcondition with an immediate readback."""
 
-        address: 目标地址（支持 @rip, 0x..., 符号名）。
-        values: 空格分隔的十六进制值。
+        address_error = validate_intent_text(address, "address")
+        values_error = validate_intent_text(values, "values")
+        if address_error or values_error:
+            return make_response(
+                "windbg_write_memory",
+                errors=[error for error in (address_error, values_error) if error],
+                verification_status="not_run",
+            )
+        expected_values, byte_error = _parse_byte_values(values)
+        if byte_error:
+            return make_response(
+                "windbg_write_memory",
+                errors=[byte_error],
+                verification_status="not_run",
+            )
 
-        示例: windbg_write_memory("0x7ff600010000", "90 90") — 写入两个 NOP
-        """
-        if not address.strip():
-            return make_error("windbg_write_memory", "", "invalid_argument", "'address' is required.")
-        if not values.strip():
-            return make_error("windbg_write_memory", "", "invalid_argument", "'values' is required.")
+        resolution, resolved_address = resolve_expression(address)
+        sources = [resolution.source]
+        data = {"input": address, "requested_values": expected_values}
+        if resolved_address is None:
+            return make_response(
+                "windbg_write_memory",
+                sources,
+                data,
+                verification_status="not_run",
+            )
+        data["resolved_address"] = resolved_address
 
-        command = f"eb {address} {values}"
-        raw = _exec(command)
-        if is_error_output(raw):
-            return make_error("windbg_write_memory", command, "debugger_error", raw.strip(), raw=raw)
+        write = run_mutation(f"eb {resolved_address} {' '.join(expected_values)}")
+        sources.append(write.source)
+        if write.execution.status != "completed":
+            return make_response(
+                "windbg_write_memory",
+                sources,
+                data,
+                verification_status="indeterminate",
+                errors=[error_item(
+                    "verification_not_run",
+                    "Memory write did not complete; readback was not attempted.",
+                    stage="verification",
+                )],
+            )
 
+        readback = run_read(
+            f"db {resolved_address} L0n{len(expected_values)}",
+            parse_memory_dump,
+        )
+        sources.append(readback.source)
+        observed_values = []
+        if readback.parsed is not None:
+            observed_values = [
+                f"0x{entry['value'].lower().zfill(2)}"
+                for entry in readback.parsed.data.get("data", [])
+                if isinstance(entry, dict) and isinstance(entry.get("value"), str)
+            ][:len(expected_values)]
+        data["readback_values"] = observed_values
+
+        readback_complete = (
+            readback.execution.status == "completed"
+            and readback.parsed is not None
+            and readback.parsed.status == "complete"
+        )
+        verified = readback_complete and observed_values == expected_values
+        errors = []
+        if not readback_complete:
+            errors.append(error_item(
+                "verification_indeterminate",
+                "Memory readback was not complete enough to verify the write.",
+                stage="verification",
+            ))
+        elif not verified:
+            errors.append(error_item(
+                "verification_failed",
+                "Memory readback did not match the requested byte values.",
+                recoverable=False,
+                stage="verification",
+            ))
         return make_response(
             "windbg_write_memory",
-            command,
-            data={"address": address, "values": values, "status": "completed"},
-            raw=raw,
-            next_actions=[next_action("windbg_read_memory", {"address": address, "size": "0x20", "format": "byte"}, "Verify the bytes after writing memory.")],
+            sources,
+            data,
+            verification_status=(
+                "verified" if verified else "failed" if readback_complete
+                else "indeterminate"
+            ),
+            errors=errors,
         )

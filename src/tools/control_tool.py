@@ -1,59 +1,93 @@
-"""执行控制工具 — 继续运行、单步。"""
+"""Execution-control tool with explicit target-state reporting."""
 
 from typing import Literal
 
-from ._registry import _exec
-from ._response import is_error_output, make_error, make_response, next_action, parse_int_arg
+from ._evidence import run_mutation
+from ._models import ToolEnvelope
+from ._response import error_item, make_response, parse_int_arg
+
+
+ControlAction = Literal[
+    "go", "g", "step_into", "t", "step_over", "p", "step_out", "gu",
+]
+
+
+def _target_state(status: str) -> str:
+    if status == "completed":
+        return "broken"
+    if status == "timeout":
+        return "running"
+    return "indeterminate"
 
 
 def register_control_tool(mcp):
     @mcp.tool()
-    def windbg_control(action: Literal["go", "g", "step_into", "t", "step_over", "p", "step_out", "gu"], count: str = "1") -> str:
-        """控制目标执行流程。
+    def windbg_control(action: ControlAction, count: str = "1") -> ToolEnvelope:
+        """Resume or step the target without reporting an invented completion state."""
 
-        action 值:
-        - "go" 或 "g": 继续运行
-        - "step_into" 或 "t": 单步进入
-        - "step_over" 或 "p": 单步跳过
-        - "step_out" 或 "gu": 单步跳出
-
-        count: 执行次数，默认 1。
-
-        执行后返回目标状态。如果目标仍在运行中（go 未断下），返回提示。
-        """
-        n, arg_error = parse_int_arg(count, "count", default=1, min_value=1, max_value=1000)
-        if arg_error:
-            return make_response("windbg_control", "", ok=False, errors=[arg_error])
-
-        a = action.lower()
-        if a in ("go", "g"):
-            command = "g"
-        elif a in ("step_into", "t"):
-            command = f"t {n}"
-        elif a in ("step_over", "p"):
-            command = f"p {n}"
-        elif a in ("step_out", "gu"):
-            command = f"gu {n}" if n == 1 else "gu"
-        else:
-            return make_error(
+        count_value, count_error = parse_int_arg(
+            count,
+            "count",
+            default=1,
+            min_value=1,
+            max_value=1000,
+        )
+        if count_error:
+            return make_response(
                 "windbg_control",
-                "",
-                "invalid_argument",
-                f"unknown action '{action}'; valid: go, step_into, step_over, step_out",
+                errors=[count_error],
+                verification_status="not_run",
+            )
+        normalized = action.lower().strip()
+        aliases = {
+            "g": "go",
+            "t": "step_into",
+            "p": "step_over",
+            "gu": "step_out",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in ("go", "step_into", "step_over", "step_out"):
+            return make_response(
+                "windbg_control",
+                errors=[error_item("invalid_argument", "Unknown control action.")],
+                verification_status="not_run",
+            )
+        if normalized == "go" and count_value != 1:
+            return make_response(
+                "windbg_control",
+                errors=[error_item(
+                    "invalid_argument",
+                    "'go' does not support count values other than 1.",
+                )],
+                verification_status="not_run",
             )
 
-        raw = _exec(command)
-        if is_error_output(raw):
-            return make_error("windbg_control", command, "debugger_error", raw.strip(), raw=raw)
+        if normalized == "go":
+            commands = ["g"]
+        elif normalized == "step_into":
+            commands = [f"t 0n{count_value}"]
+        elif normalized == "step_over":
+            commands = [f"p 0n{count_value}"]
+        else:
+            commands = ["gu"] * count_value
 
-        actions = []
-        if a not in ("go", "g"):
-            actions.append(next_action("windbg_context", {"scope": "default"}, "Refresh state after execution control."))
+        sources = []
+        final_status = "indeterminate"
+        for command in commands:
+            evidence = run_mutation(command)
+            sources.append(evidence.source)
+            final_status = _target_state(evidence.execution.status)
+            if evidence.execution.status != "completed":
+                break
 
+        verification_status = "verified" if final_status == "broken" else "indeterminate"
         return make_response(
             "windbg_control",
-            command,
-            data={"action": a, "count": n, "status": "completed"},
-            raw=raw,
-            next_actions=actions,
+            sources,
+            {
+                "action": normalized,
+                "count": count_value,
+                "target_state": final_status,
+            },
+            verification_status=verification_status,
         )

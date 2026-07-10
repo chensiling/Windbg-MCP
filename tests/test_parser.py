@@ -27,7 +27,10 @@ from tools._parser import (
     parse_breakpoints,
 )
 from tools import breakpoint_tool
-from tools._response import parsed_response
+from tools import _registry
+from tools._models import ToolEnvelope
+from tools._response import parsed_response, source_item
+from debugger.engine import ExecutionResult
 
 
 # ---------------------------------------------------------------------------
@@ -663,12 +666,12 @@ class TestParseResult:
             ParseResult("partial", {"answer": 42}, "", [], [])
 
 
-class TestLegacyConsumers:
+class TestTypedConsumers:
     @pytest.mark.parametrize(
         ("raw", "expected_count"),
         [(SAMPLE_BREAKPOINTS, 2), ("", 0)],
     )
-    def test_registered_breakpoint_list_serializes_complete_result(
+    def test_registered_breakpoint_list_returns_typed_complete_result(
         self,
         monkeypatch,
         raw,
@@ -685,12 +688,23 @@ class TestLegacyConsumers:
                 return register
 
         mcp = CapturingMCP()
-        monkeypatch.setattr(breakpoint_tool, "_exec", lambda command: raw)
+
+        class Executor:
+            def execute(self, command, **policy):
+                assert command == "bl"
+                return ExecutionResult(
+                    status="completed",
+                    output=raw,
+                    complete=True,
+                )
+
+        monkeypatch.setattr(_registry, "_executor", Executor())
         breakpoint_tool.register_breakpoint_tool(mcp)
 
-        payload = json.loads(mcp.registered("list"))
-        assert len(payload["data"]["breakpoints"]) == expected_count
-        assert payload["errors"] == []
+        payload = mcp.registered("list")
+        assert isinstance(payload, ToolEnvelope)
+        assert len(payload.data["breakpoints"]) == expected_count
+        assert payload.errors == []
 
     @pytest.mark.parametrize(
         ("raw", "expected_status"),
@@ -699,7 +713,7 @@ class TestLegacyConsumers:
             ("malformed breakpoint output", "failed"),
         ],
     )
-    def test_legacy_response_path_handles_incomplete_results(
+    def test_typed_response_path_preserves_incomplete_results(
         self,
         raw,
         expected_status,
@@ -707,10 +721,16 @@ class TestLegacyConsumers:
         result = parse_breakpoints(raw)
 
         assert result.status == expected_status
-        payload = json.loads(parsed_response("windbg_breakpoint", "bl", result, raw))
-        assert payload["data"] == {}
-        assert payload["raw"] == raw
-        assert payload["errors"][0]["code"] == "parse_failed"
+        execution = ExecutionResult(
+            status="completed",
+            output=raw,
+            complete=True,
+        )
+        source = source_item("bl", execution, result)
+        payload = parsed_response("windbg_breakpoint", source, result)
+        assert payload.data == dict(result.data)
+        assert payload.raw == raw
+        assert payload.errors[0].code == f"parse_{expected_status}"
 
 
 class TestParseCompleteness:
