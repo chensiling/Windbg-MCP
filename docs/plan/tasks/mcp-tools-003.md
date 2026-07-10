@@ -1,7 +1,7 @@
 ---
 id: mcp-tools-003
 scope: tools-and-response
-status: in-progress
+status: done
 depends-on: [mcp-parser-001, mcp-engine-002]
 ---
 
