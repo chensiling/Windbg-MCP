@@ -72,7 +72,7 @@ _RE_DEBUGGER_COMMAND = re.compile(
     r"(?:r(?:\s+.*)?|k[bcpvlnf]*(?:\s+.*)?|u[a-z]?(?:\s+.*)?|"
     r"d[abuwdq](?:\s+.*)?|lm(?:\s+.*)?|x\s+.+|ln\s+.+|dt\s+.+|"
     r"\?\s+.+|!analyze(?:\s+.*)?|!process(?:\s+.*)?|~(?:\s+.*)?|"
-    r"bl(?:\s+.*)?|!running(?:\s+.*)?)",
+    r"bl(?:\s+.*)?|!running(?:\s+.*)?|\.frame(?:\s+.*)?)",
     re.IGNORECASE,
 )
 
@@ -364,6 +364,73 @@ def parse_stack_k(raw: str) -> ParseResult:
 
 def parse_stack_kp(raw: str) -> ParseResult:
     return _parse_stack_core(raw, has_params=True)
+
+
+# ---------------------------------------------------------------------------
+# parse_frame_selection — parse the frame selected by ".frame"
+# ---------------------------------------------------------------------------
+
+_RE_SELECTED_FRAME = re.compile(
+    r"^\s*(?P<index>[0-9a-f]{1,3})\s+(?P<child_sp>[0-9a-f`]+)\s+"
+    r"(?P<ret_addr>[0-9a-f`]+)\s+(?P<call_site>.+)$",
+    re.IGNORECASE,
+)
+
+_RE_FRAME_SELECTION_ERROR = re.compile(
+    r"^\s*(?:cannot find frame\s+(?:0x)?[0-9a-f]+"
+    r"(?:,\s*previous scope unchanged)?|invalid frame(?:\s+(?:0x)?[0-9a-f]+)?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_frame_selection(raw: str) -> ParseResult:
+    """Parse the authoritative frame index or an explicit selection failure."""
+    if not raw or not raw.strip():
+        return _failed(raw)
+
+    selected_frame: dict[str, Any] | None = None
+    selection_error: str | None = None
+    unparsed_lines: list[str] = []
+
+    for raw_line in raw.splitlines():
+        line = _clean_line(raw_line)
+        if not line.strip():
+            continue
+
+        if _RE_FRAME_SELECTION_ERROR.fullmatch(line):
+            selection_error = line.strip()
+            continue
+
+        match = _RE_SELECTED_FRAME.fullmatch(line)
+        if match:
+            selected_frame = {
+                "frame": int(match.group("index"), 16),
+                "index": match.group("index").lower(),
+                "child_sp": _canonical_hex(match.group("child_sp")),
+                "ret_addr": _canonical_hex(match.group("ret_addr")),
+                "call_site": match.group("call_site").strip(),
+            }
+            continue
+
+        unparsed_lines.append(line)
+
+    if selection_error is not None:
+        data: dict[str, Any] = {
+            "selected": False,
+            "message": selection_error,
+        }
+        if selected_frame is not None:
+            data["current_frame"] = selected_frame
+        return _parse_result(raw, data, unparsed_lines)
+
+    if selected_frame is not None:
+        return _parse_result(
+            raw,
+            {"selected": True, **selected_frame},
+            unparsed_lines,
+        )
+
+    return _failed(raw)
 
 
 # ---------------------------------------------------------------------------

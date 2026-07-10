@@ -1,5 +1,6 @@
 """Aggregate debugger context with per-command evidence."""
 
+import re
 from typing import Literal
 
 from ._evidence import run_read
@@ -25,20 +26,56 @@ _MODULE_LIMIT = 60
 ContextScope = Literal["default", "threads", "processes", "all"]
 
 
-def _target_mode(raw: str) -> str:
-    text = raw.lower()
-    if "kd>" in text or "kernel" in text:
+_KERNEL_SYSTEM = re.compile(
+    r"(?im)^\s*[.#]\s+\d+\s+[^:\r\n]*\bkernel\b[^:\r\n]*(?:mode|dump)\s*:"
+)
+_USER_SYSTEM = re.compile(
+    r"(?im)^\s*[.#]\s+\d+\s+[^:\r\n]*\buser\b[^:\r\n]*(?:mode|dump)\s*:"
+)
+_KERNEL_PROMPT = re.compile(r"(?im)^\s*(?:\d+:\s*)?kd>\s*")
+_USER_PROMPT = re.compile(
+    r"(?im)^\s*\d+:[0-9a-f]+(?::(?:x86|amd64|arm|arm64))?>\s*"
+)
+_SYSTEM_DUMP = re.compile(
+    r"(?im)^\s*[.#]\s+\d+\s+[^:\r\n]*\bdump\b[^:\r\n]*:"
+)
+_SYSTEM_LIVE = re.compile(
+    r"(?im)^\s*[.#]\s+\d+\s+live\b[^\r\n]*:"
+)
+
+
+def _target_mode(*raw_values: str) -> str:
+    text = "\n".join(raw_values)
+    if _KERNEL_SYSTEM.search(text):
         return "kernel"
-    if "user mode" in text or "cdb" in text:
+    if _USER_SYSTEM.search(text):
+        return "user"
+    if (
+        _KERNEL_PROMPT.search(text)
+        or re.search(r"(?im)^\s*kernel base\s*=", text)
+        or re.search(r"(?im)^\s*psloadedmodulelist\s*=", text)
+    ):
+        return "kernel"
+    if (
+        _USER_PROMPT.search(text)
+        or re.search(r"(?im)^\s*process uptime\s*:", text)
+        or re.search(r"(?i)\buser mode (?:target|dump)\b", text)
+    ):
         return "user"
     return "unknown"
 
 
-def _session_kind(raw: str) -> str:
-    text = raw.lower()
-    if "dump" in text:
+def _session_kind(*raw_values: str) -> str:
+    text = "\n".join(raw_values)
+    if _SYSTEM_DUMP.search(text) or re.search(
+        r"(?i)\b(?:dump file|dump target|mini dump|memory dump)\b",
+        text,
+    ):
         return "dump"
-    if "live" in text:
+    if _SYSTEM_LIVE.search(text) or re.search(
+        r"(?i)\blive\s+(?:user|kernel)\s+mode\b",
+        text,
+    ):
         return "live"
     return "unknown"
 
@@ -59,20 +96,28 @@ def register_context_tool(mcp):
             )
 
         target = run_read("vertarget")
+        debug_systems = run_read("||")
         registers = run_read("r", parse_registers)
         stack = run_read("kP 0n1", parse_stack_kp)
         event = run_read(".lastevent")
         modules_evidence = run_read("lm", parse_modules)
         sources = [
             target.source,
+            debug_systems.source,
             registers.source,
             stack.source,
             event.source,
             modules_evidence.source,
         ]
 
-        target_mode = _target_mode(target.execution.output)
-        session_kind = _session_kind(target.execution.output)
+        target_mode = _target_mode(
+            target.execution.output,
+            debug_systems.execution.output,
+        )
+        session_kind = _session_kind(
+            target.execution.output,
+            debug_systems.execution.output,
+        )
         data: dict[str, object] = {
             "debugger_connected": target.execution.status == "completed",
             "target_mode": target_mode,

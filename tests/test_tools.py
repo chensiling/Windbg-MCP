@@ -30,9 +30,34 @@ DISASSEMBLY = """ntdll!LdrpDoDebuggerBreak+0x35:
 MEMORY_BYTES = "00007ff9`850bd78d  90 91"
 MODULE_DEFERRED = """start             end                 module name
 00007ff9`84fa0000 00007ff9`85206000   ntdll      (deferred)"""
+MODULE_LOADED = """start             end                 module name
+00007ff9`84fa0000 00007ff9`85206000   ntdll      (pdb symbols) C:\\symbols\\ntdll.pdb"""
 THREADS_USER = ".  0  Id: 1234.5678 Suspend: 1 Teb: 00000083`7ea20000 Unfrozen"
+THREADS_KERNEL = """System Processors:  (0000000000000001)
+  Idle Processors:  (0000000000000000)
+       Prcbs             Current         (pri) Next            (pri) Idle
+  0    fffff80526ad6180  ffffda0273eea040 ( 8) ffffda02746490c0 (14) fffff80599bd15c0"""
 ANALYZE = """BUGCHECK_CODE:  1e
 PROCESS_NAME:  notepad.exe"""
+VERTARGET_USER = """Windows 10 Version 26200 MP (32 procs) Free x64
+Product: WinNt, suite: SingleUserTS
+Debug session time: Fri Jul 10 22:52:23.535 2026 (UTC + 8:00)
+System Uptime: 0 days 5:28:06.213
+Process Uptime: 0 days 0:00:00.036
+  Kernel time: 0 days 0:00:00.000
+  User time: 0 days 0:00:00.000"""
+VERTARGET_KERNEL = """Windows 10 Kernel Version 26100 MP (4 procs) Free x64
+Kernel base = 0xfffff805`99000000 PsLoadedModuleList = 0xfffff805`99e2f2b0
+Debug session time: Fri Jul 10 22:52:23.535 2026 (UTC + 8:00)
+System Uptime: 0 days 5:28:06.213"""
+SYSTEM_USER_LIVE = ".  0 Live user mode: <Local>"
+SYSTEM_USER_DUMP = ".  0 64-bit User mini dump: C:\\dumps\\notepad.dmp"
+SYSTEM_KERNEL_LIVE = ".  0 Live kernel mode: NET:port=50000"
+SYSTEM_KERNEL_DUMP = ".  0 64-bit Kernel bitmap dump: C:\\dumps\\memory.dmp"
+FRAME_SELECTED_5 = (
+    "05 000000d1`47e7f400 00007fff`e5a4d83a     "
+    "ntdll!LdrpDoDebuggerBreak+0x35"
+)
 BREAKPOINT = (
     " 0 e Disable Clear  00007ff9`850bd78d     "
     "0001 (0001)  0:**** ntdll!LdrpDoDebuggerBreak @rcx == 0"
@@ -177,6 +202,68 @@ def test_backtrace_uses_explicit_decimal_depth(toolset, monkeypatch):
     assert executor.calls[0]["read_only"] is True
 
 
+def test_backtrace_verifies_frame_before_attributing_locals(toolset, monkeypatch):
+    executor = install_executor(
+        monkeypatch,
+        (".frame 0n5", completed(FRAME_SELECTED_5)),
+        ("dv /t /i", completed("int x = 1")),
+    )
+
+    result = toolset["windbg_backtrace"](frame="5")
+
+    assert result.ok is True
+    assert result.verification_status == "verified"
+    assert result.data["requested_frame"] == 5
+    assert result.data["frame"] == 5
+    assert result.data["locals_raw"] == "int x = 1"
+    executor.assert_done()
+
+
+def test_backtrace_rejects_invalid_frame_without_collecting_locals(
+    toolset,
+    monkeypatch,
+):
+    executor = install_executor(
+        monkeypatch,
+        (
+            ".frame 0n5",
+            completed(
+                "Cannot find frame 0x5, previous scope unchanged\n"
+                "00 000000d1`47e7f400 00007fff`e5a4d83a     "
+                "ntdll!LdrpDoDebuggerBreak+0x35"
+            ),
+        ),
+    )
+
+    result = toolset["windbg_backtrace"](frame="5")
+
+    assert result.ok is False
+    assert result.verification_status == "failed"
+    assert result.data["requested_frame"] == 5
+    assert result.data["current_frame"]["frame"] == 0
+    assert "frame" not in result.data
+    assert "locals_raw" not in result.data
+    assert any(error.code == "frame_selection_failed" for error in result.errors)
+    executor.assert_done()
+
+
+def test_backtrace_rejects_selected_frame_mismatch(toolset, monkeypatch):
+    executor = install_executor(
+        monkeypatch,
+        (".frame 0n5", completed(FRAME_SELECTED_5.replace("05 ", "04 ", 1))),
+    )
+
+    result = toolset["windbg_backtrace"](frame="5")
+
+    assert result.ok is False
+    assert result.verification_status == "failed"
+    assert result.data["selected_frame"] == 4
+    assert "frame" not in result.data
+    assert "locals_raw" not in result.data
+    assert any(error.code == "frame_selection_mismatch" for error in result.errors)
+    executor.assert_done()
+
+
 def test_lookup_explicit_kind_and_visible_auto_routing(toolset, monkeypatch):
     executor = install_executor(
         monkeypatch,
@@ -262,6 +349,8 @@ def test_write_memory_is_verified_by_readback(toolset, monkeypatch):
 
     assert result.ok is True
     assert result.verification_status == "verified"
+    assert result.data["readback_address"] == "0x00007ff9850bd78d"
+    assert result.data["readback_offsets"] == ["0x0", "0x1"]
     assert result.data["readback_values"] == ["0x90", "0x91"]
     assert len(result.sources) == 3
     assert executor.calls[1]["read_only"] is False
@@ -272,6 +361,11 @@ def test_write_memory_is_verified_by_readback(toolset, monkeypatch):
     ("readback", "expected_verification"),
     [
         ("00007ff9`850bd78d  90 92", "failed"),
+        ("00007ff9`850bd790  90 91", "failed"),
+        (
+            "00007ff9`850bd78d  90\n00007ff9`850bd78f  91",
+            "failed",
+        ),
         (MEMORY_BYTES + "\nUNEXPECTED", "indeterminate"),
     ],
 )
@@ -440,7 +534,7 @@ def test_symbol_reload_verifies_by_querying_module_state(toolset, monkeypatch):
     executor = install_executor(
         monkeypatch,
         (".reload /f ntdll", completed("reload requested")),
-        ("lm m ntdll", completed(MODULE_DEFERRED)),
+        ("lm m ntdll", completed(MODULE_LOADED)),
     )
 
     result = toolset["windbg_sympath"]("reload", module="ntdll")
@@ -454,32 +548,121 @@ def test_symbol_reload_verifies_by_querying_module_state(toolset, monkeypatch):
     assert executor.calls[0]["retryable"] is False
 
 
-def test_context_separates_target_mode_session_kind_and_sources(toolset, monkeypatch):
+@pytest.mark.parametrize(
+    ("module_output", "expected_verification"),
+    [
+        (MODULE_DEFERRED, "failed"),
+        ("start             end                 module name", "indeterminate"),
+    ],
+)
+def test_symbol_reload_never_verifies_deferred_or_missing_module_state(
+    toolset,
+    monkeypatch,
+    module_output,
+    expected_verification,
+):
+    install_executor(
+        monkeypatch,
+        (".reload /f ntdll", completed("reload requested")),
+        ("lm m ntdll", completed(module_output)),
+    )
+
+    result = toolset["windbg_sympath"]("reload", module="ntdll")
+
+    assert result.ok is False
+    assert result.verification_status == expected_verification
+    assert any(error.stage == "verification" for error in result.errors)
+
+
+@pytest.mark.parametrize(
+    (
+        "vertarget",
+        "debug_systems",
+        "expected_mode",
+        "expected_session",
+        "thread_command",
+        "thread_output",
+        "expected_route",
+    ),
+    [
+        (
+            VERTARGET_USER,
+            SYSTEM_USER_LIVE,
+            "user",
+            "live",
+            "~",
+            THREADS_USER,
+            "user_threads",
+        ),
+        (
+            VERTARGET_USER,
+            SYSTEM_USER_DUMP,
+            "user",
+            "dump",
+            "~",
+            THREADS_USER,
+            "user_threads",
+        ),
+        (
+            VERTARGET_KERNEL,
+            SYSTEM_KERNEL_LIVE,
+            "kernel",
+            "live",
+            "!running -ti",
+            THREADS_KERNEL,
+            "kernel_running",
+        ),
+        (
+            VERTARGET_KERNEL,
+            SYSTEM_KERNEL_DUMP,
+            "kernel",
+            "dump",
+            "!running -ti",
+            THREADS_KERNEL,
+            "kernel_running",
+        ),
+    ],
+)
+def test_context_routes_real_user_kernel_and_live_dump_forms(
+    toolset,
+    monkeypatch,
+    vertarget,
+    debug_systems,
+    expected_mode,
+    expected_session,
+    thread_command,
+    thread_output,
+    expected_route,
+):
     executor = install_executor(
         monkeypatch,
-        ("vertarget", completed("Live user mode target")),
+        ("vertarget", completed(vertarget)),
+        ("||", completed(debug_systems)),
         ("r", completed(REGISTERS)),
         ("kP 0n1", completed(STACK)),
         (".lastevent", completed("Last event: breakpoint")),
         ("lm", completed(MODULE_DEFERRED)),
-        ("~", completed(THREADS_USER)),
+        (thread_command, completed(thread_output)),
     )
 
     result = toolset["windbg_context"]("threads")
 
-    assert result.data["target_mode"] == "user"
-    assert result.data["session_kind"] == "live"
+    assert result.ok is True
+    assert result.data["target_mode"] == expected_mode
+    assert result.data["session_kind"] == expected_session
     assert result.data["target_state"] == "broken"
-    assert len(result.sources) == 6
+    assert len(result.sources) == 7
     assert result.inferences[0].name == "symbol_health"
-    assert result.inferences[1].value == "user_threads"
-    assert executor.calls[-1]["command"] == "~"
+    assert result.inferences[1].value == expected_route
+    assert executor.calls[-1]["command"] == thread_command
+    executor.assert_done()
 
 
 def test_crash_analysis_uses_exception_context_only_for_user_dump(toolset, monkeypatch):
     executor = install_executor(
         monkeypatch,
-        ("vertarget", completed("User mode dump target")),
+        ("vertarget", completed(VERTARGET_USER)),
+        ("||", completed(SYSTEM_USER_DUMP)),
         ("!analyze -v", completed(ANALYZE)),
         (".ecxr", completed(REGISTERS)),
         ("r", completed(REGISTERS)),
@@ -492,16 +675,18 @@ def test_crash_analysis_uses_exception_context_only_for_user_dump(toolset, monke
     assert result.data["session_kind"] == "dump"
     assert result.data["context_kind"] == "exception_context"
     assert [source.command for source in result.sources] == [
-        "vertarget", "!analyze -v", ".ecxr", "r", "kP 0n30",
+        "vertarget", "||", "!analyze -v", ".ecxr", "r", "kP 0n30",
     ]
     assert executor.calls[3]["retryable"] is False
     assert executor.calls[4]["retryable"] is False
+    assert executor.calls[5]["retryable"] is False
 
 
 def test_crash_analysis_does_not_invent_exception_context(toolset, monkeypatch):
     install_executor(
         monkeypatch,
-        ("vertarget", completed("User mode dump target")),
+        ("vertarget", completed(VERTARGET_USER)),
+        ("||", completed(SYSTEM_USER_DUMP)),
         ("!analyze -v", completed(ANALYZE)),
         (".ecxr", completed("Unable to get exception context, NTSTATUS 0xc0000001")),
         ("r", completed(REGISTERS)),
@@ -513,6 +698,43 @@ def test_crash_analysis_does_not_invent_exception_context(toolset, monkeypatch):
     assert result.ok is False
     assert result.data["context_kind"] == "current_context"
     assert any(error.code == "exception_context_unavailable" for error in result.errors)
+
+
+@pytest.mark.parametrize(
+    ("vertarget", "debug_systems", "expected_mode", "expected_session"),
+    [
+        (VERTARGET_USER, SYSTEM_USER_LIVE, "user", "live"),
+        (VERTARGET_KERNEL, SYSTEM_KERNEL_LIVE, "kernel", "live"),
+        (VERTARGET_KERNEL, SYSTEM_KERNEL_DUMP, "kernel", "dump"),
+    ],
+)
+def test_crash_analysis_does_not_select_ecxr_outside_user_dumps(
+    toolset,
+    monkeypatch,
+    vertarget,
+    debug_systems,
+    expected_mode,
+    expected_session,
+):
+    executor = install_executor(
+        monkeypatch,
+        ("vertarget", completed(vertarget)),
+        ("||", completed(debug_systems)),
+        ("!analyze -v", completed(ANALYZE)),
+        ("r", completed(REGISTERS)),
+        ("kP 0n30", completed(STACK)),
+    )
+
+    result = toolset["windbg_analyze"]("crash")
+
+    assert result.ok is True
+    assert result.data["target_mode"] == expected_mode
+    assert result.data["session_kind"] == expected_session
+    assert result.data["context_kind"] == "current_context"
+    assert [call["command"] for call in executor.calls] == [
+        "vertarget", "||", "!analyze -v", "r", "kP 0n30",
+    ]
+    executor.assert_done()
 
 
 @pytest.mark.parametrize(

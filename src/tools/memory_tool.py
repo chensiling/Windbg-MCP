@@ -53,6 +53,15 @@ def _parse_byte_values(values: str) -> tuple[list[str], object | None]:
     return parsed, None
 
 
+def _same_address(left: object, right: object) -> bool:
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    try:
+        return int(left.replace("`", ""), 0) == int(right.replace("`", ""), 0)
+    except ValueError:
+        return False
+
+
 def register_memory_tool(mcp):
     @mcp.tool()
     def windbg_read_memory(
@@ -156,13 +165,27 @@ def register_memory_tool(mcp):
             parse_memory_dump,
         )
         sources.append(readback.source)
+        readback_data = (
+            dict(readback.parsed.data)
+            if readback.parsed is not None
+            else {}
+        )
+        entries = [
+            entry for entry in readback_data.get("data", [])
+            if isinstance(entry, dict)
+        ]
         observed_values = []
-        if readback.parsed is not None:
-            observed_values = [
-                f"0x{entry['value'].lower().zfill(2)}"
-                for entry in readback.parsed.data.get("data", [])
-                if isinstance(entry, dict) and isinstance(entry.get("value"), str)
-            ][:len(expected_values)]
+        observed_offsets = []
+        for entry in entries:
+            value = entry.get("value")
+            offset = entry.get("offset")
+            if isinstance(value, str):
+                observed_values.append(f"0x{value.lower().zfill(2)}")
+            if isinstance(offset, str):
+                observed_offsets.append(offset.lower())
+        readback_address = readback_data.get("address")
+        data["readback_address"] = readback_address
+        data["readback_offsets"] = observed_offsets
         data["readback_values"] = observed_values
 
         readback_complete = (
@@ -170,7 +193,21 @@ def register_memory_tool(mcp):
             and readback.parsed is not None
             and readback.parsed.status == "complete"
         )
-        verified = readback_complete and observed_values == expected_values
+        address_matches = _same_address(readback_address, resolved_address)
+        range_matches = (
+            readback_data.get("format") == "hex_byte"
+            and len(entries) == len(expected_values)
+            and observed_offsets == [
+                f"0x{offset:x}" for offset in range(len(expected_values))
+            ]
+        )
+        values_match = observed_values == expected_values
+        verified = (
+            readback_complete
+            and address_matches
+            and range_matches
+            and values_match
+        )
         errors = []
         if not readback_complete:
             errors.append(error_item(
@@ -178,7 +215,14 @@ def register_memory_tool(mcp):
                 "Memory readback was not complete enough to verify the write.",
                 stage="verification",
             ))
-        elif not verified:
+        elif not address_matches or not range_matches:
+            errors.append(error_item(
+                "verification_failed",
+                "Memory readback did not cover the requested address and contiguous byte range.",
+                recoverable=False,
+                stage="verification",
+            ))
+        elif not values_match:
             errors.append(error_item(
                 "verification_failed",
                 "Memory readback did not match the requested byte values.",

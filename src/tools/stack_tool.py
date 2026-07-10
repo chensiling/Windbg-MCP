@@ -2,7 +2,7 @@
 
 from ._evidence import run_command, run_mutation, run_read
 from ._models import ToolEnvelope
-from ._parser import parse_stack_k, parse_stack_kp
+from ._parser import parse_frame_selection, parse_stack_k, parse_stack_kp
 from ._response import error_item, make_response, next_action, parse_int_arg
 
 
@@ -28,11 +28,71 @@ def register_stack_tool(mcp):
             )
             if frame_error:
                 return make_response("windbg_backtrace", errors=[frame_error])
-            selection = run_mutation(f".frame 0n{frame_number}")
+            selection = run_mutation(
+                f".frame 0n{frame_number}",
+                parse_frame_selection,
+            )
             sources = [selection.source]
-            data = {"frame": frame_number}
-            if selection.execution.status != "completed":
-                return make_response("windbg_backtrace", sources, data)
+            data: dict[str, object] = {"requested_frame": frame_number}
+            selection_data = (
+                dict(selection.parsed.data)
+                if selection.parsed is not None
+                else {}
+            )
+            if "message" in selection_data:
+                data["selection_error"] = selection_data["message"]
+            if "current_frame" in selection_data:
+                data["current_frame"] = selection_data["current_frame"]
+
+            selection_complete = (
+                selection.execution.status == "completed"
+                and selection.parsed is not None
+                and selection.parsed.status == "complete"
+            )
+            if not selection_complete or selection_data.get("selected") is not True:
+                explicit_failure = (
+                    selection_complete
+                    and selection_data.get("selected") is False
+                )
+                return make_response(
+                    "windbg_backtrace",
+                    sources,
+                    data,
+                    verification_status=(
+                        "failed" if explicit_failure else "indeterminate"
+                    ),
+                    errors=[error_item(
+                        (
+                            "frame_selection_failed" if explicit_failure
+                            else "frame_selection_indeterminate"
+                        ),
+                        (
+                            "The debugger rejected the requested frame."
+                            if explicit_failure
+                            else "The selected frame could not be observed."
+                        ),
+                        recoverable=not explicit_failure,
+                        stage="verification",
+                    )],
+                )
+
+            selected_frame = selection_data.get("frame")
+            data["selected_frame"] = selected_frame
+            if selected_frame != frame_number:
+                return make_response(
+                    "windbg_backtrace",
+                    sources,
+                    data,
+                    verification_status="failed",
+                    errors=[error_item(
+                        "frame_selection_mismatch",
+                        "The debugger selected a different frame than requested.",
+                        recoverable=False,
+                        stage="verification",
+                    )],
+                )
+
+            data["frame"] = selected_frame
             locals_evidence = run_command(
                 "dv /t /i",
                 read_only=True,
@@ -41,7 +101,12 @@ def register_stack_tool(mcp):
             sources.append(locals_evidence.source)
             if locals_evidence.execution.output:
                 data["locals_raw"] = locals_evidence.execution.output
-            return make_response("windbg_backtrace", sources, data)
+            return make_response(
+                "windbg_backtrace",
+                sources,
+                data,
+                verification_status="verified",
+            )
 
         depth_value, depth_error = parse_int_arg(
             depth,

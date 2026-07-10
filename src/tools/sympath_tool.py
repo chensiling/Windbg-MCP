@@ -1,5 +1,6 @@
 """Symbol path management and symbol-state observations."""
 
+from fnmatch import fnmatchcase
 import re
 from typing import Literal
 
@@ -54,6 +55,31 @@ def _health_inference(modules):
         _symbol_health(modules),
         "derived from the symbol-state text reported for each module",
     )
+
+
+def _reload_module_state(module: dict[str, str]) -> str:
+    info = module.get("info", "").casefold()
+    if any(
+        marker in info
+        for marker in ("deferred", "no symbols", "export symbols")
+    ):
+        return "unresolved"
+    if "pdb symbols" in info or "symbols loaded" in info:
+        return "loaded"
+    return "unknown"
+
+
+def _reload_targets(
+    requested_module: str,
+    modules: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    if not requested_module:
+        return modules
+    pattern = requested_module.casefold()
+    return [
+        module for module in modules
+        if fnmatchcase(module.get("name", "").casefold(), pattern)
+    ]
 
 
 def _validate_symbol_path(path: str):
@@ -226,21 +252,38 @@ def register_sympath_tool(mcp):
         )
         query_observed = (
             query.execution.status == "completed"
+            and query.execution.complete
             and query.parsed is not None
             and query.parsed.status == "complete"
         )
-        verification_status = (
-            "verified" if normalized == "reload" and query_observed
-            else "failed" if normalized == "reload"
-            else "not_required"
-        )
         verification_errors = []
-        if normalized == "reload" and not query_observed:
-            verification_errors.append(error_item(
-                "verification_failed",
-                "Module state could not be observed after symbol reload.",
-                stage="verification",
-            ))
+        verification_status = "not_required"
+        if normalized == "reload":
+            targets = _reload_targets(module, modules) if query_observed else []
+            states = [_reload_module_state(target) for target in targets]
+            if not query_observed or not targets:
+                verification_status = "indeterminate"
+                verification_errors.append(error_item(
+                    "verification_indeterminate",
+                    "The requested module state could not be observed after symbol reload.",
+                    stage="verification",
+                ))
+            elif "unresolved" in states:
+                verification_status = "failed"
+                verification_errors.append(error_item(
+                    "verification_failed",
+                    "One or more requested modules still lack loaded PDB symbols.",
+                    stage="verification",
+                ))
+            elif "unknown" in states:
+                verification_status = "indeterminate"
+                verification_errors.append(error_item(
+                    "verification_indeterminate",
+                    "The requested module symbol state was not explicit after reload.",
+                    stage="verification",
+                ))
+            else:
+                verification_status = "verified"
         return make_response(
             "windbg_sympath",
             sources,

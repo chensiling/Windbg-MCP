@@ -44,10 +44,17 @@ def register_analyze_tool(mcp):
             )
 
         target = run_read("vertarget")
-        target_mode = _target_mode(target.execution.output)
-        session_kind = _session_kind(target.execution.output)
+        debug_systems = run_read("||")
+        target_mode = _target_mode(
+            target.execution.output,
+            debug_systems.execution.output,
+        )
+        session_kind = _session_kind(
+            target.execution.output,
+            debug_systems.execution.output,
+        )
         analysis = run_read(analyze_command, parse_analyze)
-        sources = [target.source, analysis.source]
+        sources = [target.source, debug_systems.source, analysis.source]
         data = {
             "scope": "crash",
             "target_mode": target_mode,
