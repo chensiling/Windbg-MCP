@@ -1,116 +1,134 @@
-"""崩溃分析工具。"""
+"""Crash and hang analysis with retained context evidence."""
 
 from typing import Literal
 
-from ._registry import _exec
+from ._evidence import run_command, run_mutation, run_read
+from ._models import ToolEnvelope
 from ._parser import parse_analyze, parse_registers, parse_stack_kp
-from ._response import is_error_output, make_error, make_response, next_action, parsed_response
+from ._response import error_item, make_response, next_action
+from .context_tool import _session_kind, _target_mode
+
+
+AnalyzeScope = Literal["crash", "hang", "quick"]
 
 
 def register_analyze_tool(mcp):
     @mcp.tool()
-    def windbg_analyze(scope: Literal["crash", "hang", "quick"] = "crash") -> str:
-        """运行自动化崩溃/挂起分析。
+    def windbg_analyze(scope: AnalyzeScope = "crash") -> ToolEnvelope:
+        """Collect crash or hang observations without collapsing command evidence."""
 
-        scope 值:
-        - "crash": 完整崩溃分析。运行 !analyze -v，同时收集寄存器、调用栈。
-          返回: {bugcheck_code?, faulting_ip?, process_name?, stack_text?, registers, backtrace}
-        - "hang": 挂起分析。使用 !analyze -v -hang 并收集所有线程栈。
-          返回分析输出。
-        - "quick": 快速分析。仅运行 !analyze -v，不收集额外数据。
-          返回: {bugcheck_code?, faulting_ip?, process_name?, image_name?, stack_text?}
-
-        返回 JSON 或结构化字典。解析失败时返回原始文本。
-        """
-        s = scope.lower().strip()
-
-        if s == "quick":
-            command = "!analyze -v"
-            raw = _exec(command)
-            parsed = parse_analyze(raw)
-            return parsed_response(
-                "windbg_analyze",
-                command,
-                parsed,
-                raw,
-                data={**parsed, "scope": "quick"} if "raw" not in parsed else None,
-                next_actions=[next_action("windbg_context", {"scope": "default"}, "Collect registers, stack top, event, and modules around the analysis result.")],
-            )
-
-        elif s == "hang":
-            command = "!analyze -v -hang"
-            raw = _exec(command)
-            if is_error_output(raw):
-                return make_error("windbg_analyze", command, "debugger_error", raw.strip(), raw=raw)
+        normalized_scope = scope.lower().strip()
+        if normalized_scope not in ("crash", "hang", "quick"):
             return make_response(
                 "windbg_analyze",
-                command,
-                data={"scope": "hang", "analysis_raw": raw.strip()},
-                raw=raw,
-                next_actions=[next_action("windbg_context", {"scope": "threads"}, "Inspect threads after hang analysis.")],
+                errors=[error_item("invalid_argument", "Unknown analysis scope.")],
             )
 
-        elif s == "crash":
-            result = {}
-            errors = []
-            commands = ["!analyze -v"]
+        analyze_command = (
+            "!analyze -v -hang" if normalized_scope == "hang" else "!analyze -v"
+        )
+        if normalized_scope != "crash":
+            analysis = run_read(analyze_command, parse_analyze)
+            data: dict[str, object] = {"scope": normalized_scope}
+            if analysis.parsed is not None:
+                data.update(dict(analysis.parsed.data))
+            return make_response(
+                "windbg_analyze",
+                [analysis.source],
+                data,
+                next_actions=[next_action(
+                    "windbg_context",
+                    {"scope": "default"},
+                    "Correlate analysis evidence with current target context.",
+                )],
+            )
 
-            # !analyze -v
-            raw = _exec("!analyze -v")
-            parsed = parse_analyze(raw)
-            if "raw" not in parsed:
-                result.update(parsed)
+        target = run_read("vertarget")
+        debug_systems = run_read("||")
+        target_mode = _target_mode(
+            target.execution.output,
+            debug_systems.execution.output,
+        )
+        session_kind = _session_kind(
+            target.execution.output,
+            debug_systems.execution.output,
+        )
+        analysis = run_read(analyze_command, parse_analyze)
+        sources = [target.source, debug_systems.source, analysis.source]
+        data = {
+            "scope": "crash",
+            "target_mode": target_mode,
+            "session_kind": session_kind,
+            "context_kind": "current_context",
+        }
+        errors = []
+        if analysis.parsed is not None:
+            data.update(dict(analysis.parsed.data))
+
+        dependent_context = False
+        if target_mode == "user" and session_kind == "dump":
+            exception_context = run_mutation(".ecxr", parse_registers)
+            sources.append(exception_context.source)
+            exception_registers = (
+                exception_context.parsed.data.get("registers")
+                if exception_context.parsed is not None
+                else None
+            )
+            if (
+                exception_context.execution.status == "completed"
+                and isinstance(exception_registers, dict)
+                and exception_registers
+            ):
+                data["context_kind"] = "exception_context"
+                dependent_context = True
             else:
-                result["analyze_raw"] = parsed["raw"]
-                errors.append({"code": "parse_failed", "message": "Could not parse !analyze -v output.", "recoverable": True})
+                errors.append(error_item(
+                    "exception_context_unavailable",
+                    ".ecxr did not produce an observable exception register context.",
+                    stage="execution",
+                ))
 
-            # 寄存器
-            try:
-                commands.append("r")
-                raw = _exec("r")
-                parsed = parse_registers(raw)
-                if "raw" not in parsed:
-                    result["registers"] = parsed.get("registers", {})
-                    result["flags"] = parsed.get("flags", {})
-                else:
-                    errors.append({"code": "parse_failed", "message": "Could not parse register output.", "recoverable": True})
-            except Exception as e:
-                errors.append({"code": "exec_failed", "message": f"register collection failed: {e}", "recoverable": True})
-
-            # 调用栈
-            try:
-                commands.append("kP 30")
-                raw = _exec("kP 30")
-                parsed = parse_stack_kp(raw)
-                if "raw" not in parsed:
-                    result["backtrace"] = parsed.get("frames", [])
-                else:
-                    errors.append({"code": "parse_failed", "message": "Could not parse backtrace output.", "recoverable": True})
-            except Exception as e:
-                errors.append({"code": "exec_failed", "message": f"backtrace collection failed: {e}", "recoverable": True})
-
-            if not result:
-                return make_error(
-                    "windbg_analyze",
-                    commands,
-                    "analyze_failed",
-                    "No usable analysis data was collected.",
-                    next_actions=[next_action("windbg_context", {"scope": "default"}, "Collect the current debugger context before retrying analysis.")],
-                )
-
-            actions = [
-                next_action("windbg_context", {"scope": "default"}, "Correlate analysis with current registers and instruction."),
-                next_action("windbg_backtrace", {"depth": "30"}, "Review the full parsed call stack."),
-            ]
-            if "faulting_ip" in result:
-                actions.append(next_action("windbg_disassemble", {"at": "@rip", "count": "8"}, "Inspect instructions near the faulting instruction pointer."))
-
-            return make_response(
-                "windbg_analyze",
-                commands,
-                data={**result, "scope": "crash"},
-                errors=errors,
-                next_actions=actions,
+        if dependent_context:
+            registers = run_command(
+                "r",
+                parse_registers,
+                read_only=True,
+                retryable=False,
             )
+            backtrace = run_command(
+                "kP 0n30",
+                parse_stack_kp,
+                read_only=True,
+                retryable=False,
+            )
+        else:
+            registers = run_read("r", parse_registers)
+            backtrace = run_read("kP 0n30", parse_stack_kp)
+        sources.extend([registers.source, backtrace.source])
 
-        return make_error("windbg_analyze", "", "invalid_argument", "scope must be one of crash, hang, quick.")
+        if registers.parsed is not None:
+            register_data = dict(registers.parsed.data)
+            for key in ("registers", "flags", "segments", "current"):
+                if key in register_data:
+                    data[key] = register_data[key]
+        if backtrace.parsed is not None:
+            data["backtrace"] = list(backtrace.parsed.data.get("frames", []))
+
+        actions = [next_action(
+            "windbg_context",
+            {"scope": "default"},
+            "Correlate analysis evidence with current target context.",
+        )]
+        if data.get("faulting_ip"):
+            actions.append(next_action(
+                "windbg_disassemble",
+                {"at": "@rip", "count": "8"},
+                "Inspect the faulting instruction region.",
+            ))
+        return make_response(
+            "windbg_analyze",
+            sources,
+            data,
+            errors=errors,
+            next_actions=actions,
+        )

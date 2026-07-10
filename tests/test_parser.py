@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from tools._parser import (
     ParseResult,
+    parse_frame_selection,
     parse_registers,
     parse_stack_k,
     parse_stack_kp,
@@ -27,7 +28,10 @@ from tools._parser import (
     parse_breakpoints,
 )
 from tools import breakpoint_tool
-from tools._response import parsed_response
+from tools import _registry
+from tools._models import ToolEnvelope
+from tools._response import parsed_response, source_item
+from debugger.engine import ExecutionResult
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +73,14 @@ SAMPLE_STACK_KP_PARAMETERS = """Child-SP          RetAddr               Call Sit
 
 SAMPLE_STACK_KP_INLINE_PARAMETERS = """ChildEBP RetAddr Args to Child Call Site
 0012f280 77ab1234 00000001 0012f2f0 ntdll!ExampleFunction+0x12"""
+
+SAMPLE_FRAME_SELECTED = (
+    "05 000000d1`47e7f400 00007fff`e5a4d83a     "
+    "ntdll!LdrpDoDebuggerBreak+0x35"
+)
+
+SAMPLE_FRAME_REJECTED = """Cannot find frame 0x5, previous scope unchanged
+00 000000d1`47e7f400 00007fff`e5a4d83a     ntdll!LdrpDoDebuggerBreak+0x35"""
 
 SAMPLE_DISASM = """ntdll!LdrpDoDebuggerBreak+0x35:
 00007ff9`850bd78d cc              int     3
@@ -260,6 +272,29 @@ class TestParseStack:
     def test_parse_k_no_header(self):
         result = parse_stack_k("garbage text")
         assert result["raw"] == "garbage text"
+
+
+class TestParseFrameSelection:
+    def test_selected_frame(self):
+        result = parse_frame_selection("0:000> .frame 0n5\n" + SAMPLE_FRAME_SELECTED)
+
+        assert result.status == "complete"
+        assert result["selected"] is True
+        assert result["frame"] == 5
+        assert result["child_sp"] == "0x000000d147e7f400"
+
+    def test_rejected_frame_preserves_actual_current_frame(self):
+        result = parse_frame_selection(SAMPLE_FRAME_REJECTED)
+
+        assert result.status == "complete"
+        assert result["selected"] is False
+        assert result["current_frame"]["frame"] == 0
+
+    def test_unrecognized_frame_output_fails(self):
+        result = parse_frame_selection("unrecognized frame output")
+
+        assert result.status == "failed"
+        assert result["raw"] == "unrecognized frame output"
 
 
 class TestParseDisassembly:
@@ -555,7 +590,7 @@ class TestParseThreadListKernel:
 
 
 ALL_PARSERS = [
-    parse_registers, parse_stack_k, parse_stack_kp,
+    parse_registers, parse_stack_k, parse_stack_kp, parse_frame_selection,
     parse_disassembly, parse_memory_dump, parse_modules,
     parse_symbol_list, parse_nearest_symbol, parse_type_info,
     parse_evaluate, parse_analyze, parse_process_list,
@@ -566,6 +601,7 @@ COMPLETE_CASES = [
     (parse_registers, SAMPLE_REGISTERS),
     (parse_stack_k, SAMPLE_STACK_K),
     (parse_stack_kp, SAMPLE_STACK_KP),
+    (parse_frame_selection, SAMPLE_FRAME_SELECTED),
     (parse_disassembly, SAMPLE_DISASM),
     (parse_memory_dump, SAMPLE_MEM_DD),
     (parse_modules, SAMPLE_MODULES),
@@ -663,12 +699,12 @@ class TestParseResult:
             ParseResult("partial", {"answer": 42}, "", [], [])
 
 
-class TestLegacyConsumers:
+class TestTypedConsumers:
     @pytest.mark.parametrize(
         ("raw", "expected_count"),
         [(SAMPLE_BREAKPOINTS, 2), ("", 0)],
     )
-    def test_registered_breakpoint_list_serializes_complete_result(
+    def test_registered_breakpoint_list_returns_typed_complete_result(
         self,
         monkeypatch,
         raw,
@@ -685,12 +721,23 @@ class TestLegacyConsumers:
                 return register
 
         mcp = CapturingMCP()
-        monkeypatch.setattr(breakpoint_tool, "_exec", lambda command: raw)
+
+        class Executor:
+            def execute(self, command, **policy):
+                assert command == "bl"
+                return ExecutionResult(
+                    status="completed",
+                    output=raw,
+                    complete=True,
+                )
+
+        monkeypatch.setattr(_registry, "_executor", Executor())
         breakpoint_tool.register_breakpoint_tool(mcp)
 
-        payload = json.loads(mcp.registered("list"))
-        assert len(payload["data"]["breakpoints"]) == expected_count
-        assert payload["errors"] == []
+        payload = mcp.registered("list")
+        assert isinstance(payload, ToolEnvelope)
+        assert len(payload.data["breakpoints"]) == expected_count
+        assert payload.errors == []
 
     @pytest.mark.parametrize(
         ("raw", "expected_status"),
@@ -699,7 +746,7 @@ class TestLegacyConsumers:
             ("malformed breakpoint output", "failed"),
         ],
     )
-    def test_legacy_response_path_handles_incomplete_results(
+    def test_typed_response_path_preserves_incomplete_results(
         self,
         raw,
         expected_status,
@@ -707,10 +754,16 @@ class TestLegacyConsumers:
         result = parse_breakpoints(raw)
 
         assert result.status == expected_status
-        payload = json.loads(parsed_response("windbg_breakpoint", "bl", result, raw))
-        assert payload["data"] == {}
-        assert payload["raw"] == raw
-        assert payload["errors"][0]["code"] == "parse_failed"
+        execution = ExecutionResult(
+            status="completed",
+            output=raw,
+            complete=True,
+        )
+        source = source_item("bl", execution, result)
+        payload = parsed_response("windbg_breakpoint", source, result)
+        assert payload.data == dict(result.data)
+        assert payload.raw == raw
+        assert payload.errors[0].code == f"parse_{expected_status}"
 
 
 class TestParseCompleteness:

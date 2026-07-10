@@ -1,7 +1,7 @@
 ---
 id: mcp-tools-003
 scope: tools-and-response
-status: ready
+status: in-progress
 depends-on: [mcp-parser-001, mcp-engine-002]
 ---
 
@@ -16,8 +16,11 @@ Add typed response models, migrate all business tools to the new execution/parse
 
 ## Path
 
+- `docs/plan/tasks/mcp-tools-003.md`
+- `pyproject.toml`
 - `src/tools/`
 - `tests/test_response.py`
+- `tests/test_parser.py`
 - `tests/test_tools.py`
 
 ## Verification
