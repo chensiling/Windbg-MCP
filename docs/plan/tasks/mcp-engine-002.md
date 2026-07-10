@@ -1,7 +1,7 @@
 ---
 id: mcp-engine-002
 scope: debugger-engine
-status: in-progress
+status: done
 depends-on: []
 ---
 
