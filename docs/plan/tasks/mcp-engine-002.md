@@ -1,7 +1,7 @@
 ---
 id: mcp-engine-002
 scope: debugger-engine
-status: ready
+status: in-progress
 depends-on: []
 ---
 
@@ -16,9 +16,11 @@ Introduce `ExecutionResult`, enforce configured timeouts, use per-command marker
 
 ## Path
 
+- `docs/plan/tasks/mcp-engine-002.md`
 - `src/debugger/engine.py`
 - `src/debugger/native_engine.py`
 - `src/debugger/executor.py`
+- `src/tools/_registry.py`
 - `src/server.py`
 - `tests/test_engine.py`
 - `tests/test_server.py`
