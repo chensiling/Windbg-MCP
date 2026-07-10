@@ -15,7 +15,10 @@ logger = logging.getLogger(__name__)
 KD_X64 = r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\kd.exe"
 CDB_X64 = r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"
 MARKER_PREFIX = "__MCP_END_"
-_PROMPT_RE = re.compile(r"^(?:\d+:[0-9a-fA-F]+|\d+:\s*kd|kd)>$")
+_PROMPT_RE = re.compile(
+    r"^(?:\d+:[0-9a-f]+(?::(?:x86|amd64|arm|arm64))?|\d+:\s*kd|kd)>$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -47,16 +50,7 @@ class SubprocessEngine(DebugEngine):
 
     @property
     def connected(self) -> bool:
-        proc = self._proc
-        if not self._connected or proc is None:
-            return False
-        try:
-            exited = proc.poll() is not None
-        except (AttributeError, OSError):
-            exited = False
-        if exited and self._proc is proc:
-            self._connected = False
-        return self._connected
+        return self._connected and self._proc is not None
 
     @property
     def target_running(self) -> bool:
@@ -130,26 +124,14 @@ class SubprocessEngine(DebugEngine):
         if timeout <= 0:
             raise ValueError("timeout must be greater than zero")
 
-        proc = self._proc
-        if not self.connected or proc is None:
-            return ExecutionResult(
-                status="disconnected",
-                error="not connected to debugger process",
-                attempts=0,
-            )
-
         with self._lock:
-            if proc is not self._proc or not self.connected:
-                return ExecutionResult(
-                    status="disconnected",
-                    error="debugger process disconnected before command submission",
-                    attempts=0,
-                )
-
+            proc = self._proc
             output_queue = self._output_queue
             async_output, stream_closed = self._drain_queue(output_queue)
+
             if stream_closed is not None:
-                self._mark_disconnected(proc)
+                if proc is not None:
+                    self._mark_disconnected(proc)
                 return ExecutionResult(
                     status="disconnected",
                     error=stream_closed.error or "debugger output stream reached EOF",
@@ -157,7 +139,14 @@ class SubprocessEngine(DebugEngine):
                     async_output=async_output,
                 )
 
-            marker = self._new_marker()
+            if proc is None or not self.connected:
+                return ExecutionResult(
+                    status="disconnected",
+                    error="not connected to debugger process",
+                    attempts=0,
+                    async_output=async_output,
+                )
+
             if proc.stdin is None:
                 return ExecutionResult(
                     status="failed",
@@ -166,17 +155,25 @@ class SubprocessEngine(DebugEngine):
                     async_output=async_output,
                 )
 
-            submitted = False
+            try:
+                marker = self._new_marker()
+            except Exception as e:
+                return ExecutionResult(
+                    status="failed",
+                    error=f"could not create command completion marker: {e}",
+                    attempts=0,
+                    async_output=async_output,
+                )
+
             try:
                 proc.stdin.write(f"{command}\n.printf \"{marker}\\n\"\n")
-                submitted = True
                 proc.stdin.flush()
-            except (BrokenPipeError, OSError) as e:
+            except Exception as e:
                 self._mark_disconnected(proc)
                 return ExecutionResult(
-                    status="indeterminate" if submitted else "disconnected",
+                    status="indeterminate",
                     error=f"debugger process rejected command: {e}",
-                    attempts=1 if submitted else 0,
+                    attempts=1,
                     async_output=async_output,
                 )
 
@@ -216,8 +213,8 @@ class SubprocessEngine(DebugEngine):
     ) -> None:
         read_error = None
         if proc.stdout is None:
-            self._mark_disconnected(proc)
             output_queue.put(_StreamClosed("debugger process has no stdout pipe"))
+            self._mark_disconnected(proc)
             return
         try:
             for line in iter(proc.stdout.readline, ""):
@@ -226,8 +223,8 @@ class SubprocessEngine(DebugEngine):
             read_error = f"debugger output reader failed: {e}"
             logger.error("read_loop died: %s", e)
         finally:
-            self._mark_disconnected(proc)
             output_queue.put(_StreamClosed(read_error))
+            self._mark_disconnected(proc)
 
     def _read_until_marker(
         self,

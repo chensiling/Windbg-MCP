@@ -3,7 +3,7 @@ import logging
 import time
 from threading import Lock
 
-from .engine import DebugEngine, ExecutionResult
+from .engine import DebugEngine, ExecutionContractError, ExecutionResult
 
 logger = logging.getLogger(__name__)
 
@@ -40,46 +40,39 @@ class CommandExecutor:
         read_only: bool,
         retryable: bool,
     ) -> ExecutionResult:
-        if not self._engine.connected:
-            return ExecutionResult(
-                status="disconnected",
-                error="not connected to debug target",
-                attempts=0,
-            )
-
         total_attempts = 0
         session_restarted = False
-        async_output = []
+        command_output: list[str] = []
+        async_output: list[str] = []
 
         for attempt in range(1, self._max_retries + 1):
             try:
                 result = self._engine.execute(command, timeout=self._timeout)
             except Exception as e:
-                logger.warning("command attempt %d failed: %s", attempt, e)
-                result = ExecutionResult(
-                    status="indeterminate",
-                    error=f"debugger engine raised {type(e).__name__}: {e}",
-                    attempts=1,
-                )
+                raise ExecutionContractError(
+                    "debugger engine raised instead of returning ExecutionResult"
+                ) from e
 
             if not isinstance(result, ExecutionResult):
-                return ExecutionResult(
-                    status="failed",
-                    error=(
-                        "debugger engine contract violation: execute() must return "
-                        "ExecutionResult"
-                    ),
-                    attempts=total_attempts,
-                    session_restarted=session_restarted,
-                    async_output="".join(async_output),
+                raise ExecutionContractError(
+                    "debugger engine execute() must return ExecutionResult"
                 )
+            try:
+                result.validate()
+            except (TypeError, ValueError) as e:
+                raise ExecutionContractError(
+                    "debugger engine returned an invalid ExecutionResult"
+                ) from e
 
             total_attempts += result.attempts
+            if result.output:
+                command_output.append(result.output)
             if result.async_output:
                 async_output.append(result.async_output)
             session_restarted = session_restarted or result.session_restarted
             result = replace(
                 result,
+                output="".join(command_output),
                 attempts=total_attempts,
                 session_restarted=session_restarted,
                 async_output="".join(async_output),

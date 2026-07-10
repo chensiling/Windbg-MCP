@@ -2,7 +2,11 @@ import io
 
 import pytest
 
-from src.debugger.engine import DebugEngine, ExecutionResult
+from src.debugger.engine import (
+    DebugEngine,
+    ExecutionContractError,
+    ExecutionResult,
+)
 from src.debugger.executor import CommandExecutor
 from src.debugger import executor as executor_module
 from src.debugger import native_engine
@@ -90,6 +94,28 @@ class TestSubprocessEngine:
         assert first_marker != second_marker
         assert first_marker.startswith(native_engine.MARKER_PREFIX)
 
+    @pytest.mark.parametrize(
+        "prompt",
+        ["0:000> ", "0:000:x86> ", "0: kd> ", "kd> "],
+    )
+    def test_accepts_real_user_and_kernel_prompt_markers(self, prompt):
+        engine = None
+        proc = None
+
+        def complete_command():
+            marker = _marker_from_last_write(proc)
+            engine._output_queue.put("command output\n")
+            engine._output_queue.put(f"{prompt}{marker}\n")
+
+        engine, proc = _connected_engine(complete_command)
+
+        result = engine.execute("r", timeout=0.1)
+
+        assert result.status == "completed"
+        assert result.complete is True
+        assert result.output == "command output\n"
+        assert native_engine.MARKER_PREFIX not in result.output
+
     def test_preserves_output_observed_before_command(self):
         engine = None
         proc = None
@@ -133,6 +159,74 @@ class TestSubprocessEngine:
 
         assert engine.connected is False
         assert isinstance(output_queue.get_nowait(), _StreamClosed)
+
+    @pytest.mark.parametrize("through_executor", [False, True])
+    def test_eof_before_request_preserves_async_output(self, through_executor):
+        engine, _ = _connected_engine()
+        engine._output_queue.put("async before EOF\n")
+        engine._output_queue.put(_StreamClosed())
+        engine._connected = False
+
+        if through_executor:
+            result = CommandExecutor(engine).execute("r")
+        else:
+            result = engine.execute("r")
+
+        assert result.status == "disconnected"
+        assert result.async_output == "async before EOF\n"
+        assert result.error == "debugger output stream reached EOF"
+        assert result.attempts == 0
+        assert result.complete is False
+        assert engine.connected is False
+        assert engine._output_queue.empty()
+
+    def test_marker_generation_failure_is_proven_pre_submission(self, monkeypatch):
+        engine, proc = _connected_engine()
+        calls = []
+
+        def fail_marker():
+            calls.append(True)
+            raise RuntimeError("entropy unavailable")
+
+        monkeypatch.setattr(engine, "_new_marker", fail_marker)
+        executor = CommandExecutor(engine, max_retries=3)
+
+        result = executor.execute("eb 0x1000 90")
+
+        assert result.status == "failed"
+        assert result.attempts == 0
+        assert result.error == (
+            "could not create command completion marker: entropy unavailable"
+        )
+        assert proc.stdin.writes == []
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("failure_stage", ["write", "flush"])
+    def test_ambiguous_submission_failure_is_indeterminate_and_not_replayed(
+        self,
+        failure_stage,
+    ):
+        class _FailingStdin(_FakeStdin):
+            def write(self, value):
+                self.writes.append(value)
+                if failure_stage == "write":
+                    raise BrokenPipeError("pipe closed during write")
+
+            def flush(self):
+                if failure_stage == "flush":
+                    raise BrokenPipeError("pipe closed during flush")
+
+        engine, proc = _connected_engine()
+        proc.stdin = _FailingStdin()
+        executor = CommandExecutor(engine, max_retries=3)
+
+        result = executor.execute("eb 0x1000 90")
+
+        assert result.status == "indeterminate"
+        assert result.attempts == 1
+        assert result.complete is False
+        assert len(proc.stdin.writes) == 1
+        assert engine.connected is False
 
 
 def _marker_from_write(value):
@@ -200,6 +294,7 @@ class TestCommandExecutor:
         assert engine.disconnect_count == 1
         assert engine.connect_count == 1
         assert result.status == "completed"
+        assert result.output == "partial\nrax=1\n"
         assert result.attempts == 2
         assert result.session_restarted is True
 
@@ -212,7 +307,14 @@ class TestCommandExecutor:
         read_only,
         retryable,
     ):
-        engine = _ScriptedEngine([RuntimeError("submission outcome unknown")])
+        engine = _ScriptedEngine(
+            [
+                ExecutionResult(
+                    status="indeterminate",
+                    error="submission outcome unknown",
+                )
+            ]
+        )
         executor = CommandExecutor(engine, max_retries=3)
 
         result = executor.execute(
@@ -225,6 +327,56 @@ class TestCommandExecutor:
         assert engine.disconnect_count == 0
         assert result.status == "indeterminate"
         assert result.attempts == 1
+
+    def test_engine_exception_is_a_contract_error_and_is_not_replayed(self):
+        engine = _ScriptedEngine([RuntimeError("engine implementation failed")])
+        executor = CommandExecutor(engine, max_retries=3)
+
+        with pytest.raises(ExecutionContractError):
+            executor.execute("eb 0x1000 90")
+
+        assert len(engine.calls) == 1
+        assert engine.disconnect_count == 0
+
+    def test_rejects_invalid_result_returned_by_engine(self):
+        invalid = ExecutionResult(
+            status="completed",
+            output="r",
+            complete=True,
+        )
+        object.__setattr__(invalid, "complete", False)
+        engine = _ScriptedEngine([invalid])
+
+        with pytest.raises(
+            ExecutionContractError,
+            match="invalid ExecutionResult",
+        ):
+            CommandExecutor(engine).execute("r")
+
+
+class TestExecutionResultValidation:
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"status": "unknown", "error": "bad status"},
+            {"status": "timeout", "error": "timed out", "attempts": -1},
+            {
+                "status": "timeout",
+                "error": "timed out",
+                "complete": True,
+            },
+            {"status": "completed", "complete": False},
+            {
+                "status": "completed",
+                "complete": True,
+                "error": "contradictory error",
+            },
+            {"status": "failed"},
+        ],
+    )
+    def test_rejects_semantically_invalid_results(self, kwargs):
+        with pytest.raises((TypeError, ValueError)):
+            ExecutionResult(**kwargs)
 
 
 class TestRegistryCompatibility:
@@ -260,3 +412,23 @@ class TestRegistryCompatibility:
 
         assert raw.startswith("error: command timed out")
         assert "partial" in raw
+
+    def test_result_entry_revalidates_executor_result(self, monkeypatch):
+        invalid = ExecutionResult(
+            status="completed",
+            output="r",
+            complete=True,
+        )
+        object.__setattr__(invalid, "attempts", -1)
+
+        class _Executor:
+            def execute(self, command, **policy):
+                return invalid
+
+        monkeypatch.setattr(_registry, "_executor", _Executor())
+
+        with pytest.raises(
+            ExecutionContractError,
+            match="invalid ExecutionResult",
+        ):
+            _registry._exec_result("r")

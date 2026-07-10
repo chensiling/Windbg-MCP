@@ -1,9 +1,9 @@
 from typing import Any, Optional
 
 try:
-    from ..debugger.engine import ExecutionResult
+    from ..debugger.engine import ExecutionContractError, ExecutionResult
 except ImportError:  # Tests import tools as a top-level package.
-    from debugger.engine import ExecutionResult
+    from debugger.engine import ExecutionContractError, ExecutionResult
 
 _executor: Optional[Any] = None
 
@@ -32,7 +32,13 @@ def _exec_result(
         retryable=retryable,
     )
     if not isinstance(result, ExecutionResult):
-        raise TypeError("executor.execute() must return ExecutionResult")
+        raise ExecutionContractError("executor.execute() must return ExecutionResult")
+    try:
+        result.validate()
+    except (TypeError, ValueError) as e:
+        raise ExecutionContractError(
+            "executor.execute() returned an invalid ExecutionResult"
+        ) from e
     return result
 
 

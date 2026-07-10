@@ -7,7 +7,7 @@ import sys
 from mcp.server.fastmcp import FastMCP
 
 from .config import Config
-from .debugger.engine import ExecutionResult
+from .debugger.engine import ExecutionContractError, ExecutionResult
 from .tools._registry import set_executor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -87,7 +87,13 @@ class _DebugExecutor:
             retryable=retryable,
         )
         if not isinstance(result, ExecutionResult):
-            raise TypeError("wrapped executor must return ExecutionResult")
+            raise ExecutionContractError("wrapped executor must return ExecutionResult")
+        try:
+            result.validate()
+        except (TypeError, ValueError) as e:
+            raise ExecutionContractError(
+                "wrapped executor returned an invalid ExecutionResult"
+            ) from e
         response = asdict(result)
         response["output"] = result.output[:2000]
         response["async_output"] = result.async_output[:2000]
