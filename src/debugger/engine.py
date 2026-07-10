@@ -17,6 +17,7 @@ _EXECUTION_STATUSES = {
     "failed",
     "indeterminate",
 }
+_SUBMISSION_REQUIRED_STATUSES = {"completed", "timeout", "indeterminate"}
 
 
 class ExecutionContractError(RuntimeError):
@@ -53,6 +54,10 @@ class ExecutionResult:
             raise TypeError("attempts must be an integer")
         if self.attempts < 0:
             raise ValueError("attempts must not be negative")
+        if self.status in _SUBMISSION_REQUIRED_STATUSES and self.attempts == 0:
+            raise ValueError(
+                f"{self.status} results require at least one command submission"
+            )
 
         if self.status == "completed":
             if not self.complete:

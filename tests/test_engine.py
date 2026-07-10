@@ -353,6 +353,27 @@ class TestCommandExecutor:
         ):
             CommandExecutor(engine).execute("r")
 
+    @pytest.mark.parametrize(
+        "result",
+        [
+            ExecutionResult(status="completed", complete=True),
+            ExecutionResult(status="timeout", error="timed out"),
+            ExecutionResult(
+                status="indeterminate",
+                error="submission outcome unknown",
+            ),
+        ],
+    )
+    def test_rejects_zero_attempt_submission_result_from_engine(self, result):
+        object.__setattr__(result, "attempts", 0)
+        engine = _ScriptedEngine([result])
+
+        with pytest.raises(
+            ExecutionContractError,
+            match="invalid ExecutionResult",
+        ):
+            CommandExecutor(engine).execute("r")
+
 
 class TestExecutionResultValidation:
     @pytest.mark.parametrize(
@@ -366,6 +387,13 @@ class TestExecutionResultValidation:
                 "complete": True,
             },
             {"status": "completed", "complete": False},
+            {"status": "completed", "complete": True, "attempts": 0},
+            {"status": "timeout", "error": "timed out", "attempts": 0},
+            {
+                "status": "indeterminate",
+                "error": "submission outcome unknown",
+                "attempts": 0,
+            },
             {
                 "status": "completed",
                 "complete": True,
@@ -377,6 +405,16 @@ class TestExecutionResultValidation:
     def test_rejects_semantically_invalid_results(self, kwargs):
         with pytest.raises((TypeError, ValueError)):
             ExecutionResult(**kwargs)
+
+    @pytest.mark.parametrize("status", ["failed", "disconnected"])
+    def test_pre_submission_failure_statuses_allow_zero_attempts(self, status):
+        result = ExecutionResult(
+            status=status,
+            error="failure before command submission",
+            attempts=0,
+        )
+
+        assert result.attempts == 0
 
 
 class TestRegistryCompatibility:
