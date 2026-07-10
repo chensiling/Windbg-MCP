@@ -1,4 +1,5 @@
 import argparse
+from dataclasses import asdict
 import json
 import logging
 import sys
@@ -6,6 +7,7 @@ import sys
 from mcp.server.fastmcp import FastMCP
 
 from .config import Config
+from .debugger.engine import ExecutionResult
 from .tools._registry import set_executor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -33,24 +35,64 @@ def _build_parser():
     return p
 
 
-def _parse_connect(connect_str: str, default_port: int):
-    s = connect_str
-    if s.startswith("tcp:"):
+def _parse_connect(connect_str: str, default_port: int) -> tuple[str, int]:
+    s = connect_str.strip()
+    if s.lower().startswith("tcp:"):
         s = s[4:]
-    host, _, port = s.partition(":")
-    return host or "127.0.0.1", int(port) if port else default_port
+
+    if not s:
+        raise ValueError("connect string must include a host or port")
+
+    if ":" not in s:
+        if s.isdecimal():
+            host, port = "127.0.0.1", int(s)
+        else:
+            host, port = s, default_port
+    else:
+        host_text, port_text = s.rsplit(":", 1)
+        host = host_text or "127.0.0.1"
+        port = int(port_text) if port_text else default_port
+
+    if not 1 <= port <= 65535:
+        raise ValueError("connect port must be between 1 and 65535")
+    return host, port
 
 
 class _DebugExecutor:
     def __init__(self, executor):
         self._e = executor
 
-    def execute(self, command: str) -> str:
+    def execute(
+        self,
+        command: str,
+        *,
+        read_only: bool = False,
+        retryable: bool = False,
+    ) -> ExecutionResult:
         print("=== REQUEST ===", flush=True)
-        print(json.dumps({"command": command}, indent=2), flush=True)
-        result = self._e.execute(command)
+        print(
+            json.dumps(
+                {
+                    "command": command,
+                    "read_only": read_only,
+                    "retryable": retryable,
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
+        result = self._e.execute(
+            command,
+            read_only=read_only,
+            retryable=retryable,
+        )
+        if not isinstance(result, ExecutionResult):
+            raise TypeError("wrapped executor must return ExecutionResult")
+        response = asdict(result)
+        response["output"] = result.output[:2000]
+        response["async_output"] = result.async_output[:2000]
         print("=== RESPONSE ===", flush=True)
-        print(json.dumps({"output": result[:2000]}, indent=2), flush=True)
+        print(json.dumps(response, indent=2), flush=True)
         return result
 
 
