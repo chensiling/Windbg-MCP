@@ -1,7 +1,7 @@
 ---
 id: mcp-integration-004
 scope: mcp-integration
-status: in-progress
+status: done
 depends-on: [mcp-tools-003]
 ---
 
