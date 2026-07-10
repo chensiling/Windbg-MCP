@@ -1,7 +1,7 @@
 ---
 id: mcp-parser-001
 scope: parser
-status: in-progress
+status: done
 depends-on: []
 ---
 

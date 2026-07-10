@@ -4,7 +4,7 @@ Task files under `tasks/` are executed in dependency order. A task is complete o
 
 | Task | Status | Depends on |
 |---|---|---|
-| `mcp-parser-001` | ready | - |
+| `mcp-parser-001` | done | - |
 | `mcp-engine-002` | ready | - |
 | `mcp-tools-003` | pending | parser, engine |
 | `mcp-integration-004` | pending | tools |
