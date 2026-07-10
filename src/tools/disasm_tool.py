@@ -1,5 +1,6 @@
 """Disassembly intent tool."""
 
+from ._annotations import READ_ONLY_TOOL
 from ._evidence import resolve_expression, run_read
 from ._models import ToolEnvelope
 from ._parser import parse_disassembly
@@ -7,7 +8,7 @@ from ._response import make_response, parse_int_arg, validate_intent_text
 
 
 def register_disasm_tool(mcp):
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_TOOL, structured_output=True)
     def windbg_disassemble(at: str, count: str = "8") -> ToolEnvelope:
         """Resolve an address expression and disassemble a bounded instruction range."""
 

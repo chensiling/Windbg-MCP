@@ -3,6 +3,7 @@
 import re
 from typing import Literal
 
+from ._annotations import DESTRUCTIVE_TOOL
 from ._evidence import resolve_expression, run_mutation, run_read
 from ._models import ToolEnvelope
 from ._parser import parse_breakpoints
@@ -20,7 +21,7 @@ def _address_value(value: str) -> int | None:
 
 
 def register_breakpoint_tool(mcp):
-    @mcp.tool()
+    @mcp.tool(annotations=DESTRUCTIVE_TOOL, structured_output=True)
     def windbg_breakpoint(
         action: BreakpointAction,
         target: str = "",

@@ -3,6 +3,7 @@
 import re
 from typing import Literal
 
+from ._annotations import READ_ONLY_TOOL
 from ._evidence import resolve_expression, run_read
 from ._models import ToolEnvelope
 from ._parser import parse_nearest_symbol, parse_symbol_list, parse_type_info
@@ -36,7 +37,7 @@ def _auto_route(value: str) -> tuple[str, str]:
 
 
 def register_lookup_tool(mcp):
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_TOOL, structured_output=True)
     def windbg_lookup(what: str, kind: LookupKind = "auto") -> ToolEnvelope:
         """Look up an address, symbol pattern, or type using an explicit route."""
 

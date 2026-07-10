@@ -1,5 +1,6 @@
 """Stack and frame inspection tool."""
 
+from ._annotations import MIXED_STATE_TOOL
 from ._evidence import run_command, run_mutation, run_read
 from ._models import ToolEnvelope
 from ._parser import parse_frame_selection, parse_stack_k, parse_stack_kp
@@ -11,7 +12,7 @@ _FALSE_VALUES = {"false", "0", "no"}
 
 
 def register_stack_tool(mcp):
-    @mcp.tool()
+    @mcp.tool(annotations=MIXED_STATE_TOOL, structured_output=True)
     def windbg_backtrace(
         depth: str = "20",
         show_params: str = "true",

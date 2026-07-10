@@ -7,6 +7,6 @@ Task files under `tasks/` are executed in dependency order. A task is complete o
 | `mcp-parser-001` | done | - |
 | `mcp-engine-002` | done | - |
 | `mcp-tools-003` | done | parser, engine |
-| `mcp-integration-004` | ready | tools |
+| `mcp-integration-004` | in-progress | tools |
 
 Review records are written under `reviews/` during delivery and removed after blocking findings are resolved and the task is merged.
