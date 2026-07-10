@@ -70,7 +70,7 @@ FastMCP server instructions tell clients to prefer business tools, evaluate `exe
 
 All 11 business tools publish the field-level `ToolEnvelope` schema and return that envelope directly as MCP `structuredContent`. `windbg_exec` deliberately disables structured output: it publishes no output schema and returns raw text content.
 
-The validated dependency floor for this integration contract is MCP Python SDK 1.28.0 and Pydantic 2.12.0; both are capped below their next major version.
+The supported dependency constraints are MCP Python SDK 1.28.0 or newer and Pydantic 2.12.0 or newer, with both capped below their next major version. This integration contract was actually validated with MCP 1.28.0 and Pydantic 2.13.4; the exact Pydantic 2.12.0 boundary was not separately exercised.
 
 Tool annotations are conservative for tools whose behavior depends on an action or optional argument:
 

@@ -27,7 +27,9 @@ MCP Client -> FastMCP -> 意图工具 -> CommandExecutor -> SubprocessEngine -> 
 - Windows 10/11 x64
 - Windows SDK，需包含 Debugging Tools
 - Python 3.10+
-- MCP Python SDK 1.28+ 与 Pydantic 2.12+（安装项目时自动解析，均限制在下一个主版本之前）
+- 支持的依赖约束：MCP Python SDK 1.28+ 与 Pydantic 2.12+（均限制在下一个主版本之前）
+
+本次合同验证实际运行 MCP 1.28.0 与 Pydantic 2.13.4。Pydantic 2.12+ 是支持约束；没有单独在精确的 2.12.0 边界版本运行测试。
 
 ### 安装
 
@@ -158,8 +160,8 @@ http://127.0.0.1:8080/mcp
 ```text
 1. windbg_context()
 2. 如果是崩溃或 dump：windbg_analyze("quick" 或 "crash")
-3. 如果调用链是关键线索：windbg_backtrace(30)
-4. 如果当前指令是关键线索：windbg_disassemble("@rip", 8)
+3. 如果调用链是关键线索：windbg_backtrace("30")
+4. 如果当前指令是关键线索：windbg_disassemble("@rip", "8")
 5. 如果需要解析符号、类型或地址：windbg_lookup(...)
 6. 如果需要验证指针或内存：windbg_evaluate(...) + windbg_read_memory(...)
 7. 只有意图工具覆盖不了时，才使用 windbg_exec(...)

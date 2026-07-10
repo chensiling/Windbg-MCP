@@ -2,6 +2,7 @@
 
 from importlib.metadata import version
 import json
+from pathlib import Path
 
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -72,9 +73,38 @@ def _major_minor(distribution: str) -> tuple[int, int]:
     return int(parts[0]), int(parts[1])
 
 
-def test_runtime_dependency_floor():
+def test_runtime_versions_satisfy_supported_constraints():
     assert (1, 28) <= _major_minor("mcp") < (2, 0)
     assert (2, 12) <= _major_minor("pydantic") < (3, 0)
+
+
+@pytest.mark.asyncio
+async def test_readme_numeric_examples_match_public_string_schemas():
+    mcp = create_mcp_server()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    readme = (Path(__file__).parents[1] / "README.md").read_text(
+        encoding="utf-8",
+    )
+
+    assert tools["windbg_backtrace"].inputSchema["properties"]["depth"]["type"] == "string"
+    assert tools["windbg_disassemble"].inputSchema["properties"]["count"]["type"] == "string"
+    assert 'windbg_backtrace("30")' in readme
+    assert 'windbg_disassemble("@rip", "8")' in readme
+    assert "windbg_backtrace(30)" not in readme
+    assert 'windbg_disassemble("@rip", 8)' not in readme
+
+
+def test_dependency_docs_separate_constraints_from_validation_evidence():
+    root = Path(__file__).parents[1]
+    architecture = (root / "docs" / "architecture" / "README.md").read_text(
+        encoding="utf-8",
+    )
+    readme = (root / "README.md").read_text(encoding="utf-8")
+
+    for document in (architecture, readme):
+        assert "Pydantic 2.13.4" in document
+        assert "2.12.0" in document
+    assert "validated dependency floor" not in architecture
 
 
 @pytest.mark.asyncio
