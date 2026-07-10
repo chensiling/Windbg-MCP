@@ -1,7 +1,7 @@
 ---
 id: mcp-tools-003
 scope: tools-and-response
-status: pending
+status: ready
 depends-on: [mcp-parser-001, mcp-engine-002]
 ---
 
