@@ -1,16 +1,17 @@
 """Shared parsers for WinDbg and cdb.exe output."""
 
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Literal
 
 
 ParseStatus = Literal["complete", "partial", "failed"]
 
 
-@dataclass(frozen=True)
-class ParseResult(Mapping[str, Any]):
+@dataclass(frozen=True, init=False)
+class ParseResult(dict[str, Any]):
     """Structured parser result with a read-only legacy mapping view.
 
     Complete results expose their parsed data through the mapping interface.
@@ -19,37 +20,51 @@ class ParseResult(Mapping[str, Any]):
     """
 
     status: ParseStatus
-    data: dict[str, Any]
+    data: Mapping[str, Any]
     raw: str
-    unparsed_lines: list[str]
-    warnings: list[str]
+    unparsed_lines: tuple[str, ...]
+    warnings: tuple[str, ...]
 
-    def __post_init__(self) -> None:
-        if self.status not in ("complete", "partial", "failed"):
-            raise ValueError(f"invalid parse status: {self.status}")
-        if self.status == "failed" and self.data:
+    def __init__(
+        self,
+        status: ParseStatus,
+        data: Mapping[str, Any],
+        raw: str,
+        unparsed_lines: list[str] | tuple[str, ...],
+        warnings: list[str] | tuple[str, ...],
+    ) -> None:
+        normalized_data = dict(data)
+        normalized_unparsed = tuple(unparsed_lines)
+        normalized_warnings = tuple(warnings)
+
+        if status not in ("complete", "partial", "failed"):
+            raise ValueError(f"invalid parse status: {status}")
+        if status == "complete" and normalized_unparsed:
+            raise ValueError("complete parse results cannot contain unparsed lines")
+        if status == "partial" and not (normalized_unparsed or normalized_warnings):
+            raise ValueError("partial parse results require an incompleteness diagnostic")
+        if status == "failed" and normalized_data:
             raise ValueError("failed parse results cannot contain parsed data")
 
-        object.__setattr__(self, "data", dict(self.data))
-        object.__setattr__(self, "unparsed_lines", list(self.unparsed_lines))
-        object.__setattr__(self, "warnings", list(self.warnings))
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "data", MappingProxyType(normalized_data))
+        object.__setattr__(self, "raw", raw)
+        object.__setattr__(self, "unparsed_lines", normalized_unparsed)
+        object.__setattr__(self, "warnings", normalized_warnings)
+        dict.__init__(self, normalized_data if status == "complete" else {"raw": raw})
 
-    def __getitem__(self, key: str) -> Any:
-        if self.status == "complete":
-            return self.data[key]
-        if key == "raw":
-            return self.raw
-        raise KeyError(key)
+    @staticmethod
+    def _readonly(*args: Any, **kwargs: Any) -> None:
+        raise TypeError("ParseResult mapping is read-only")
 
-    def __iter__(self) -> Iterator[str]:
-        if self.status == "complete":
-            return iter(self.data)
-        return iter(("raw",))
-
-    def __len__(self) -> int:
-        if self.status == "complete":
-            return len(self.data)
-        return 1
+    __setitem__ = _readonly
+    __delitem__ = _readonly
+    clear = _readonly
+    pop = _readonly
+    popitem = _readonly
+    setdefault = _readonly
+    update = _readonly
+    __ior__ = _readonly
 
 
 _RE_DEBUGGER_PROMPT = re.compile(r"^\s*(?:(?:\d+:\s*)?[^>\s]+)>\s*")
@@ -661,28 +676,34 @@ def parse_nearest_symbol(raw: str) -> ParseResult:
     if not raw or not raw.strip():
         return _failed(raw)
 
-    symbol: dict[str, str] | None = None
+    symbols: list[dict[str, str]] = []
     unparsed_lines: list[str] = []
     for raw_line in raw.splitlines():
         line = _clean_line(raw_line).strip()
         if not line or _RE_LN_HEADER.fullmatch(line):
             continue
 
-        m = _RE_LN_SYMBOL.search(line)
-        if m and symbol is None:
-            symbol = {
-                "address": _canonical_hex(m.group("address")),
-                "name": m.group("symbol"),
-            }
+        matches = list(_RE_LN_SYMBOL.finditer(line))
+        if matches:
+            symbols.extend({
+                "address": _canonical_hex(match.group("address")),
+                "name": match.group("symbol"),
+            } for match in matches)
+            unmatched = _RE_LN_SYMBOL.sub("", line).replace("|", "").strip()
+            if unmatched:
+                unparsed_lines.append(unmatched)
             continue
 
         unparsed_lines.append(line)
 
+    data: dict[str, Any] = {}
+    if symbols:
+        data = {"symbol": symbols[0], "symbols": symbols}
     return _parse_result(
         raw,
-        {"symbol": symbol} if symbol else {},
+        data,
         unparsed_lines,
-        recognized=symbol is not None,
+        recognized=bool(symbols),
     )
 
 
@@ -1047,7 +1068,7 @@ _RE_BREAKPOINT_ADDR = re.compile(r"(?P<address>[0-9a-f`]{8,})", re.IGNORECASE)
 def parse_breakpoints(raw: str) -> ParseResult:
     """解析 'bl' 输出，返回 {breakpoints: [{id, enabled, address?, detail}]}。"""
     if not raw or not raw.strip():
-        return _failed(raw)
+        return _parse_result(raw, {"breakpoints": []}, [], recognized=True)
 
     breakpoints: list[dict[str, Any]] = []
     unparsed_lines: list[str] = []
