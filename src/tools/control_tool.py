@@ -2,6 +2,7 @@
 
 from typing import Literal
 
+from ._annotations import DESTRUCTIVE_EXTERNAL_TOOL
 from ._evidence import run_mutation
 from ._models import ToolEnvelope
 from ._response import error_item, make_response, parse_int_arg
@@ -21,7 +22,7 @@ def _target_state(status: str) -> str:
 
 
 def register_control_tool(mcp):
-    @mcp.tool()
+    @mcp.tool(annotations=DESTRUCTIVE_EXTERNAL_TOOL, structured_output=True)
     def windbg_control(action: ControlAction, count: str = "1") -> ToolEnvelope:
         """Resume or step the target without reporting an invented completion state."""
 

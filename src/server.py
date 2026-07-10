@@ -13,6 +13,19 @@ from .tools._registry import set_executor
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+SERVER_INSTRUCTIONS = (
+    "Use the typed windbg_* business tools whenever they can express the "
+    "debugging intent. Treat execution_status, parse_status, and "
+    "verification_status as independent stages; ok is true only when every "
+    "required stage succeeds. sources are the authoritative per-command "
+    "evidence, while raw is only a compatibility field. data contains "
+    "observations. inferences are explicitly inferred, and next_actions are "
+    "optional suggestions that must not be executed automatically. "
+    "windbg_exec is a raw, open-world escape hatch that can execute "
+    "destructive WinDbg commands; use it only when no business tool covers "
+    "the required operation."
+)
+
 
 def _build_parser():
     p = argparse.ArgumentParser(prog="windbg-mcp", description="Windbg-MCP Server")
@@ -102,6 +115,48 @@ class _DebugExecutor:
         return result
 
 
+def create_mcp_server(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+) -> FastMCP:
+    """Create the configured FastMCP surface without starting a transport."""
+    mcp = FastMCP(
+        "windbg-mcp",
+        instructions=SERVER_INSTRUCTIONS,
+        host=host,
+        port=port,
+    )
+
+    from .tools.exec_tool import register_exec_tool
+    from .tools.control_tool import register_control_tool
+    from .tools.breakpoint_tool import register_breakpoint_tool
+    from .tools.memory_tool import register_memory_tool
+    from .tools.disasm_tool import register_disasm_tool
+    from .tools.stack_tool import register_stack_tool
+    from .tools.lookup_tool import register_lookup_tool
+    from .tools.analyze_tool import register_analyze_tool
+    from .tools.eval_tool import register_eval_tool
+    from .tools.context_tool import register_context_tool
+    from .tools.sympath_tool import register_sympath_tool
+
+    for register in (
+        register_exec_tool,
+        register_control_tool,
+        register_breakpoint_tool,
+        register_memory_tool,
+        register_disasm_tool,
+        register_stack_tool,
+        register_lookup_tool,
+        register_analyze_tool,
+        register_eval_tool,
+        register_context_tool,
+        register_sympath_tool,
+    ):
+        register(mcp)
+    return mcp
+
+
 def main():
     parser = _build_parser()
     args = parser.parse_args()
@@ -133,27 +188,7 @@ def main():
     executor = _DebugExecutor(executor_base) if config.debug_json else executor_base
     set_executor(executor)
 
-    mcp = FastMCP("windbg-mcp", host="127.0.0.1", port=config.http_port)
-
-    from .tools.exec_tool import register_exec_tool
-    from .tools.control_tool import register_control_tool
-    from .tools.breakpoint_tool import register_breakpoint_tool
-    from .tools.memory_tool import register_memory_tool
-    from .tools.disasm_tool import register_disasm_tool
-    from .tools.stack_tool import register_stack_tool
-    from .tools.lookup_tool import register_lookup_tool
-    from .tools.analyze_tool import register_analyze_tool
-    from .tools.eval_tool import register_eval_tool
-    from .tools.context_tool import register_context_tool
-    from .tools.sympath_tool import register_sympath_tool
-
-    for reg in [
-        register_exec_tool, register_control_tool, register_breakpoint_tool,
-        register_memory_tool, register_disasm_tool, register_stack_tool,
-        register_lookup_tool, register_analyze_tool, register_eval_tool,
-        register_context_tool, register_sympath_tool,
-    ]:
-        reg(mcp)
+    mcp = create_mcp_server(port=config.http_port)
 
     try:
         engine.connect()

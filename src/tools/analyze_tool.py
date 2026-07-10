@@ -2,6 +2,7 @@
 
 from typing import Literal
 
+from ._annotations import MIXED_STATE_TOOL
 from ._evidence import run_command, run_mutation, run_read
 from ._models import ToolEnvelope
 from ._parser import parse_analyze, parse_registers, parse_stack_kp
@@ -13,7 +14,7 @@ AnalyzeScope = Literal["crash", "hang", "quick"]
 
 
 def register_analyze_tool(mcp):
-    @mcp.tool()
+    @mcp.tool(annotations=MIXED_STATE_TOOL, structured_output=True)
     def windbg_analyze(scope: AnalyzeScope = "crash") -> ToolEnvelope:
         """Collect crash or hang observations without collapsing command evidence."""
 

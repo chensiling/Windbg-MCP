@@ -1,7 +1,7 @@
 ---
 id: mcp-integration-004
 scope: mcp-integration
-status: ready
+status: in-progress
 depends-on: [mcp-tools-003]
 ---
 
@@ -16,10 +16,13 @@ Expose field-level MCP output schemas, descriptions, server instructions, and sa
 
 ## Path
 
+- `docs/plan/tasks/mcp-integration-004.md`
 - `src/server.py`
+- `src/config.py`
 - `src/tools/`
 - `pyproject.toml`
 - `README.md`
+- `tests/test_parser.py`
 - `tests/test_mcp_contract.py`
 - `docs/`
 

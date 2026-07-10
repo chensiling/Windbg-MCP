@@ -1,5 +1,6 @@
 """WinDbg expression evaluation tool."""
 
+from ._annotations import READ_ONLY_TOOL
 from ._evidence import run_read
 from ._models import ToolEnvelope
 from ._parser import parse_evaluate
@@ -7,7 +8,7 @@ from ._response import make_response, validate_intent_text
 
 
 def register_eval_tool(mcp):
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_TOOL, structured_output=True)
     def windbg_evaluate(expression: str) -> ToolEnvelope:
         """Evaluate one WinDbg expression without composing debugger commands."""
 

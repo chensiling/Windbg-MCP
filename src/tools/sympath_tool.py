@@ -4,6 +4,7 @@ from fnmatch import fnmatchcase
 import re
 from typing import Literal
 
+from ._annotations import MIXED_EXTERNAL_TOOL
 from ._evidence import run_mutation, run_read
 from ._models import ToolEnvelope
 from ._parser import parse_modules
@@ -126,7 +127,7 @@ def _reported_symbol_paths(raw: str) -> list[str]:
 
 
 def register_sympath_tool(mcp):
-    @mcp.tool()
+    @mcp.tool(annotations=MIXED_EXTERNAL_TOOL, structured_output=True)
     def windbg_sympath(
         action: SympathAction,
         path: str = "",

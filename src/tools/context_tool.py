@@ -3,6 +3,7 @@
 import re
 from typing import Literal
 
+from ._annotations import READ_ONLY_TOOL
 from ._evidence import run_read
 from ._models import ToolEnvelope
 from ._parser import (
@@ -81,7 +82,7 @@ def _session_kind(*raw_values: str) -> str:
 
 
 def register_context_tool(mcp):
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_TOOL, structured_output=True)
     def windbg_context(
         scope: ContextScope = "default",
         include_raw: bool = False,

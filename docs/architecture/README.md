@@ -64,6 +64,33 @@ Required envelope fields:
 
 `windbg_exec` remains an explicit raw escape hatch. It is documented and annotated as open-world and potentially destructive.
 
+## MCP Integration Contract
+
+FastMCP server instructions tell clients to prefer business tools, evaluate `execution_status`, `parse_status`, and `verification_status` independently, treat `sources` as authoritative evidence, and never execute `next_actions` automatically. `data` contains observations; `inferences` contains labeled inferred values.
+
+All 11 business tools publish the field-level `ToolEnvelope` schema and return that envelope directly as MCP `structuredContent`. `windbg_exec` deliberately disables structured output: it publishes no output schema and returns raw text content.
+
+The supported dependency constraints are MCP Python SDK 1.28.0 or newer and Pydantic 2.12.0 or newer, with both capped below their next major version. This integration contract was actually validated with MCP 1.28.0 and Pydantic 2.13.4; the exact Pydantic 2.12.0 boundary was not separately exercised.
+
+Tool annotations are conservative for tools whose behavior depends on an action or optional argument:
+
+| Tool | Read only | Destructive | Idempotent | Open world |
+|---|---:|---:|---:|---:|
+| `windbg_context` | yes | no | yes | no |
+| `windbg_control` | no | yes | no | yes |
+| `windbg_breakpoint` | no | yes | no | no |
+| `windbg_read_memory` | yes | no | yes | no |
+| `windbg_write_memory` | no | yes | no | no |
+| `windbg_disassemble` | yes | no | yes | no |
+| `windbg_backtrace` | no | no | no | no |
+| `windbg_lookup` | yes | no | yes | no |
+| `windbg_analyze` | no | no | no | no |
+| `windbg_evaluate` | yes | no | yes | no |
+| `windbg_sympath` | no | yes | no | yes |
+| `windbg_exec` | no | yes | no | yes |
+
+`windbg_backtrace`, `windbg_analyze`, and `windbg_sympath` are not annotated read-only because some argument combinations change debugger state. Symbol-path operations are open-world because reloads may contact configured symbol servers. Execution control is open-world because resumed target code can affect external systems beyond the debugger.
+
 ## State And Inference
 
 Target architecture and session source are independent:
@@ -87,6 +114,10 @@ Intent tools reject command separators and newlines unless their documented gram
 ## Address And Numeric Rules
 
 LLMs provide an address expression as text. WinDbg evaluates registers, symbols, pointer dereferences, and arithmetic. MCP validates the expression, invokes WinDbg, and returns both `input` and `resolved_address`. Commands use explicit radix prefixes rather than relying on the debugger's current `.radix` setting.
+
+## Transport And Authentication
+
+The HTTP transport binds to `127.0.0.1` by default. The server does not implement authentication and does not accept a token environment variable. It must not be exposed to an untrusted network without an authenticated reverse proxy or another explicit access-control layer. Debug JSON logs contain commands and target output and must be treated as sensitive.
 
 ## Required Tests
 

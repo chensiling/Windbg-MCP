@@ -3,6 +3,7 @@
 import re
 from typing import Literal
 
+from ._annotations import DESTRUCTIVE_TOOL, READ_ONLY_TOOL
 from ._evidence import resolve_expression, run_mutation, run_read
 from ._models import ToolEnvelope
 from ._parser import parse_memory_dump
@@ -63,7 +64,7 @@ def _same_address(left: object, right: object) -> bool:
 
 
 def register_memory_tool(mcp):
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_TOOL, structured_output=True)
     def windbg_read_memory(
         address: str,
         size: str = "0x20",
@@ -113,7 +114,10 @@ def register_memory_tool(mcp):
             data.update(dict(read.parsed.data))
         return make_response("windbg_read_memory", sources, data)
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=DESTRUCTIVE_TOOL,
+        structured_output=True,
+    )
     def windbg_write_memory(address: str, values: str) -> ToolEnvelope:
         """Write bytes and verify the postcondition with an immediate readback."""
 

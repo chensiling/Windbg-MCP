@@ -713,7 +713,7 @@ class TestTypedConsumers:
         class CapturingMCP:
             registered = None
 
-            def tool(self):
+            def tool(self, *args, **kwargs):
                 def register(function):
                     self.registered = function
                     return function
