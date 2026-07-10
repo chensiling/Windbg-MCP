@@ -1,7 +1,7 @@
 ---
 id: mcp-parser-001
 scope: parser
-status: ready
+status: in-progress
 depends-on: []
 ---
 
@@ -18,6 +18,7 @@ Introduce the `ParseResult` contract, migrate every shared parser, and correct k
 
 - `src/tools/_parser.py`
 - `tests/test_parser.py`
+- `docs/plan/tasks/mcp-parser-001.md`
 
 ## Verification
 

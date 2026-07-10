@@ -1,11 +1,15 @@
-"""解析器单元测试 — 使用 cdb.exe 真实输出样例。"""
+"""Parser unit tests using representative cdb.exe output."""
 
 import json
 import sys
+from collections.abc import Mapping
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from tools._parser import (
+    ParseResult,
     parse_registers,
     parse_stack_k,
     parse_stack_kp,
@@ -22,6 +26,8 @@ from tools._parser import (
     parse_thread_list_kernel,
     parse_breakpoints,
 )
+from tools import breakpoint_tool
+from tools._response import parsed_response
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +61,15 @@ SAMPLE_STACK_KP_INDEXED = """0: kd>  # Child-SP          RetAddr               C
 00 ffff968b`f8207708 fffff805`2d9c18d0     nt!DbgBreakPointWithStatus
 01 ffff968b`f8207710 fffff805`2d9c1718     kdnic!TXTransmitQueuedSends+0x180"""
 
+SAMPLE_STACK_KP_PARAMETERS = """Child-SP          RetAddr               Call Site
+00 ffff968b`f8207708 fffff805`2d9c18d0     nt!ExampleFunction(
+                         first = 0x0000000000000001,
+                         second = ffff968b`f8207800
+                         )"""
+
+SAMPLE_STACK_KP_INLINE_PARAMETERS = """ChildEBP RetAddr Args to Child Call Site
+0012f280 77ab1234 00000001 0012f2f0 ntdll!ExampleFunction+0x12"""
+
 SAMPLE_DISASM = """ntdll!LdrpDoDebuggerBreak+0x35:
 00007ff9`850bd78d cc              int     3
 00007ff9`850bd78e eb00            jmp     ntdll!LdrpDoDebuggerBreak+0x38 (00007ff9`850bd790)
@@ -73,6 +88,18 @@ SAMPLE_MEM_DB = """00007ff9`850bd78d  cc eb 00 48 83 c4 38 c3-cc cc cc cc cc cc 
 00007ff9`850bd79d  83 ec 28 65 48 8b 0c 25-60 00 00 00 33 d2 41 b8  ..(eH..%`...3.A."""
 
 SAMPLE_MEM_DB_PROMPT = """0: kd> fffff805`990f90d0  cc c3 cc cc cc cc cc cc-0f 1f 84 00 00 00 00 00  ................"""
+
+SAMPLE_MEM_DD_MULTILINE = """00007ff9`850bd780  11111111 22222222 33333333 44444444
+00007ff9`850bd790  55555555 66666666 77777777 88888888"""
+
+SAMPLE_MEM_WORD = """00000000`0012f000  1234 abcd 0000 ffff"""
+
+SAMPLE_MEM_QWORD_NO_BACKTICK = """00000000`0012f000  0123456789abcdef 0000000000000000"""
+
+SAMPLE_MEM_DB_NO_DASH = """00000000`0012f000  41 42 43 44 45 46 47 48  ABCDEFGH"""
+
+SAMPLE_MEM_ASCII = '''00000000`0012f000  "Hello, w"
+00000000`0012f008  "orld!"'''
 
 SAMPLE_MODULES = """start             end                 module name
 00007ff9`84fa0000 00007ff9`85206000   ntdll      (pdb symbols)          C:\\ProgramData\\dbg\\sym\\ntdll.pdb\\23ADECD9479F123BF50906CE9B88193F1\\ntdll.pdb"""
@@ -169,6 +196,7 @@ class TestParseRegisters:
         assert result["flags"]["iopl"] == "0"
         assert "nv up ei pl zr na po nc" in result["flags"]["list"]
         assert result["current"]["symbol"] == "ntdll!LdrpDoDebuggerBreak+0x35"
+        assert result["current"]["address"] == "0x00007ff9850bd78d"
         assert result["current"]["instruction"] == "int 3"
 
     def test_empty_input(self):
@@ -178,6 +206,12 @@ class TestParseRegisters:
     def test_garbage_input(self):
         result = parse_registers("some random text")
         assert result["raw"] == "some random text"
+
+    def test_prompted_command_echo_is_ignored(self):
+        result = parse_registers("0:000> r\n" + SAMPLE_REGISTERS)
+
+        assert result.status == "complete"
+        assert result["registers"]["rip"] == "00007ff9850bd78d"
 
 
 class TestParseStack:
@@ -202,6 +236,26 @@ class TestParseStack:
         assert frames[0]["child_sp"] == "0xffff968bf8207708"
         assert frames[0]["ret_addr"] == "0xfffff8052d9c18d0"
         assert frames[0]["call_site"] == "nt!DbgBreakPointWithStatus"
+
+    def test_parse_kp_preserves_multiline_parameters(self):
+        result = parse_stack_kp(SAMPLE_STACK_KP_PARAMETERS)
+
+        assert result.status == "complete"
+        assert result["frames"][0]["parameters"] == [
+            "first = 0x0000000000000001,",
+            "second = ffff968b`f8207800",
+            ")",
+        ]
+
+    def test_parse_kp_preserves_inline_parameters(self):
+        result = parse_stack_kp(SAMPLE_STACK_KP_INLINE_PARAMETERS)
+
+        assert result.status == "complete"
+        assert result["frames"][0]["parameters"] == [
+            "0x00000001",
+            "0x0012f2f0",
+        ]
+        assert result["frames"][0]["call_site"] == "ntdll!ExampleFunction+0x12"
 
     def test_parse_k_no_header(self):
         result = parse_stack_k("garbage text")
@@ -253,6 +307,56 @@ class TestParseMemoryDump:
         assert len(result["data"]) == 16
         assert result["data"][1]["value"] == "c3"
 
+    def test_multiline_offsets_follow_dump_addresses(self):
+        result = parse_memory_dump(SAMPLE_MEM_DD_MULTILINE)
+
+        assert result.status == "complete"
+        assert [entry["offset"] for entry in result["data"]] == [
+            "0x0", "0x4", "0x8", "0xc",
+            "0x10", "0x14", "0x18", "0x1c",
+        ]
+
+    def test_multiline_qword_offsets_do_not_reset(self):
+        result = parse_memory_dump(SAMPLE_MEM_DQ)
+
+        assert [entry["offset"] for entry in result["data"]] == [
+            "0x0", "0x8", "0x10", "0x18",
+        ]
+
+    def test_detect_word_format(self):
+        result = parse_memory_dump(SAMPLE_MEM_WORD)
+
+        assert result.status == "complete"
+        assert result["format"] == "hex_word"
+        assert result["data"][3] == {"offset": "0x6", "value": "ffff"}
+
+    def test_detect_qword_without_backticks(self):
+        result = parse_memory_dump(SAMPLE_MEM_QWORD_NO_BACKTICK)
+
+        assert result.status == "complete"
+        assert result["format"] == "hex_qword"
+        assert result["data"][1]["offset"] == "0x8"
+
+    def test_detect_byte_ascii_without_separator_dash(self):
+        result = parse_memory_dump(SAMPLE_MEM_DB_NO_DASH)
+
+        assert result.status == "complete"
+        assert result["format"] == "hex_byte"
+        assert result["data"][0]["ascii"] == "A"
+        assert result["data"][7]["ascii"] == "H"
+
+    def test_detect_multiline_ascii_format(self):
+        result = parse_memory_dump(SAMPLE_MEM_ASCII)
+
+        assert result.status == "complete"
+        assert result["format"] == "ascii"
+        assert "".join(entry["ascii"] for entry in result["data"]) == "Hello, world!"
+        assert result["data"][8] == {
+            "offset": "0x8",
+            "value": "6f",
+            "ascii": "o",
+        }
+
 
 class TestParseModules:
     def test_parse(self):
@@ -283,10 +387,34 @@ class TestParseNearestSymbol:
         result = parse_nearest_symbol(SAMPLE_LN)
         assert result["symbol"]["address"] == "0x00007ff9850bd758"
         assert result["symbol"]["name"] == "ntdll!LdrpDoDebuggerBreak+0x35"
+        assert result["symbols"] == [
+            {
+                "address": "0x00007ff9850bd758",
+                "name": "ntdll!LdrpDoDebuggerBreak+0x35",
+            },
+            {
+                "address": "0x00007ff9850bd790",
+                "name": "ntdll!LdrpDoDebuggerBreak+0x68",
+            },
+        ]
 
     def test_empty(self):
         result = parse_nearest_symbol("no symbol")
         assert result["raw"] == "no symbol"
+
+    def test_same_line_unmatched_content_is_partial(self):
+        raw = (
+            "(00007ff9`850bd758) ntdll!First | "
+            "(00007ff9`850bd790) ntdll!Second trailing"
+        )
+        result = parse_nearest_symbol(raw)
+
+        assert result.status == "partial"
+        assert [symbol["name"] for symbol in result.data["symbols"]] == [
+            "ntdll!First",
+            "ntdll!Second",
+        ]
+        assert result.unparsed_lines == ("trailing",)
 
 
 class TestParseTypeInfo:
@@ -362,12 +490,33 @@ class TestParseBreakpoints:
         assert breakpoints[1]["enabled"] is False
         assert breakpoints[0]["address"] == "0x00007ff9850bd78d"
 
-    def test_empty(self):
+    def test_malformed_nonempty_output_fails(self):
         result = parse_breakpoints("no breakpoints")
+        assert result.status == "failed"
         assert result["raw"] == "no breakpoints"
+
+    def test_real_empty_engine_output_is_complete(self):
+        result = parse_breakpoints("")
+
+        assert result.status == "complete"
+        assert result["breakpoints"] == []
+
+    def test_explicit_debugger_error_fails(self):
+        raw = "error: No current process or thread"
+        result = parse_breakpoints(raw)
+
+        assert result.status == "failed"
+        assert result.data == {}
+        assert result["raw"] == raw
 
     def test_empty_prompt_means_no_breakpoints(self):
         result = parse_breakpoints(SAMPLE_BREAKPOINTS_EMPTY)
+        assert result["breakpoints"] == []
+
+    def test_standalone_prompt_and_command_mean_no_breakpoints(self):
+        result = parse_breakpoints("kd> bl")
+
+        assert result.status == "complete"
         assert result["breakpoints"] == []
 
 
@@ -405,33 +554,203 @@ class TestParseThreadListKernel:
         assert result["raw"] == "user mode output"
 
 
+ALL_PARSERS = [
+    parse_registers, parse_stack_k, parse_stack_kp,
+    parse_disassembly, parse_memory_dump, parse_modules,
+    parse_symbol_list, parse_nearest_symbol, parse_type_info,
+    parse_evaluate, parse_analyze, parse_process_list,
+    parse_thread_list_user, parse_thread_list_kernel, parse_breakpoints,
+]
+
+COMPLETE_CASES = [
+    (parse_registers, SAMPLE_REGISTERS),
+    (parse_stack_k, SAMPLE_STACK_K),
+    (parse_stack_kp, SAMPLE_STACK_KP),
+    (parse_disassembly, SAMPLE_DISASM),
+    (parse_memory_dump, SAMPLE_MEM_DD),
+    (parse_modules, SAMPLE_MODULES),
+    (parse_symbol_list, SAMPLE_SYMBOLS),
+    (parse_nearest_symbol, SAMPLE_LN),
+    (parse_type_info, SAMPLE_TYPE_INFO),
+    (parse_evaluate, SAMPLE_EVALUATE),
+    (parse_analyze, SAMPLE_ANALYZE_QUICK),
+    (parse_process_list, SAMPLE_PROCESS_LIST),
+    (parse_thread_list_user, SAMPLE_THREADS_USER),
+    (parse_thread_list_kernel, SAMPLE_RUNNING_TI),
+    (parse_breakpoints, SAMPLE_BREAKPOINTS),
+]
+
+
+class TestParseResult:
+    def test_complete_mapping_exposes_data(self):
+        result = ParseResult(
+            status="complete",
+            data={"answer": 42},
+            raw="original",
+            unparsed_lines=[],
+            warnings=[],
+        )
+
+        assert isinstance(result, Mapping)
+        assert "answer" in result
+        assert "raw" not in result
+        assert result["answer"] == 42
+        assert result.get("answer") == 42
+        assert {**result} == {"answer": 42}
+        assert json.loads(json.dumps(result)) == {"answer": 42}
+        updated = {}
+        updated.update(result)
+        assert updated == {"answer": 42}
+
+    @pytest.mark.parametrize("status", ["partial", "failed"])
+    def test_incomplete_mapping_exposes_only_raw(self, status):
+        result = ParseResult(
+            status=status,
+            data={"answer": 42} if status == "partial" else {},
+            raw="original",
+            unparsed_lines=["unexpected"],
+            warnings=["unparsed_lines"],
+        )
+
+        assert "raw" in result
+        assert "answer" not in result
+        assert result.get("raw") == "original"
+        assert result["raw"] == "original"
+        assert {**result} == {"raw": "original"}
+        assert json.loads(json.dumps(result)) == {"raw": "original"}
+
+    def test_mapping_is_read_only(self):
+        result = ParseResult("complete", {"answer": 42}, "", [], [])
+
+        with pytest.raises(TypeError):
+            result["answer"] = 0  # type: ignore[index]
+        with pytest.raises(TypeError):
+            result.update({"answer": 0})
+
+    def test_invariant_collections_are_immutable(self):
+        result = ParseResult("failed", {}, "raw", ["unparsed"], ["warning"])
+
+        with pytest.raises(TypeError):
+            result.data["answer"] = 42  # type: ignore[index]
+        with pytest.raises(AttributeError):
+            result.unparsed_lines.append("later")  # type: ignore[attr-defined]
+        with pytest.raises(AttributeError):
+            result.warnings.append("later")  # type: ignore[attr-defined]
+
+    def test_constructor_copies_invariant_collections(self):
+        data = {}
+        unparsed_lines = ["unparsed"]
+        warnings = ["warning"]
+        result = ParseResult("failed", data, "raw", unparsed_lines, warnings)
+
+        data["invented"] = True
+        unparsed_lines.append("later")
+        warnings.append("later")
+        assert result.data == {}
+        assert result.unparsed_lines == ("unparsed",)
+        assert result.warnings == ("warning",)
+
+    def test_failed_result_rejects_invented_data(self):
+        with pytest.raises(ValueError):
+            ParseResult("failed", {"answer": 42}, "", [], [])
+
+    def test_complete_result_rejects_unparsed_lines(self):
+        with pytest.raises(ValueError):
+            ParseResult("complete", {"answer": 42}, "", ["lost"], [])
+
+    def test_partial_result_requires_diagnostic(self):
+        with pytest.raises(ValueError):
+            ParseResult("partial", {"answer": 42}, "", [], [])
+
+
+class TestLegacyConsumers:
+    @pytest.mark.parametrize(
+        ("raw", "expected_count"),
+        [(SAMPLE_BREAKPOINTS, 2), ("", 0)],
+    )
+    def test_registered_breakpoint_list_serializes_complete_result(
+        self,
+        monkeypatch,
+        raw,
+        expected_count,
+    ):
+        class CapturingMCP:
+            registered = None
+
+            def tool(self):
+                def register(function):
+                    self.registered = function
+                    return function
+
+                return register
+
+        mcp = CapturingMCP()
+        monkeypatch.setattr(breakpoint_tool, "_exec", lambda command: raw)
+        breakpoint_tool.register_breakpoint_tool(mcp)
+
+        payload = json.loads(mcp.registered("list"))
+        assert len(payload["data"]["breakpoints"]) == expected_count
+        assert payload["errors"] == []
+
+    @pytest.mark.parametrize(
+        ("raw", "expected_status"),
+        [
+            (SAMPLE_BREAKPOINTS + "\nUNEXPECTED", "partial"),
+            ("malformed breakpoint output", "failed"),
+        ],
+    )
+    def test_legacy_response_path_handles_incomplete_results(
+        self,
+        raw,
+        expected_status,
+    ):
+        result = parse_breakpoints(raw)
+
+        assert result.status == expected_status
+        payload = json.loads(parsed_response("windbg_breakpoint", "bl", result, raw))
+        assert payload["data"] == {}
+        assert payload["raw"] == raw
+        assert payload["errors"][0]["code"] == "parse_failed"
+
+
+class TestParseCompleteness:
+    @pytest.mark.parametrize(("parser", "sample"), COMPLETE_CASES)
+    def test_real_samples_are_complete(self, parser, sample):
+        result = parser(sample)
+
+        assert result.status == "complete", parser.__name__
+        assert result.unparsed_lines == ()
+        assert "raw" not in result
+
+    @pytest.mark.parametrize(("parser", "sample"), COMPLETE_CASES)
+    def test_unmatched_meaningful_line_makes_result_partial(self, parser, sample):
+        raw = sample + "\nUNEXPECTED MEANINGFUL OUTPUT"
+        result = parser(raw)
+
+        assert result.status == "partial", parser.__name__
+        assert result.data
+        assert result.unparsed_lines == ("UNEXPECTED MEANINGFUL OUTPUT",)
+        assert "unparsed_lines" in result.warnings
+        assert {**result} == {"raw": raw}
+
+
 class TestFailback:
-    """所有解析器失败时必须返回 {"raw": ...} 而不是抛异常"""
+    """Failed parsers retain raw output and never raise on malformed text."""
 
     def test_all_return_raw_on_empty(self):
-        parsers = [
-            parse_registers, parse_stack_k, parse_stack_kp,
-            parse_disassembly, parse_memory_dump, parse_modules,
-            parse_symbol_list, parse_nearest_symbol, parse_type_info,
-            parse_evaluate, parse_analyze, parse_process_list,
-            parse_thread_list_user, parse_thread_list_kernel, parse_breakpoints,
-        ]
-        for parser in parsers:
+        for parser in (parser for parser in ALL_PARSERS if parser is not parse_breakpoints):
             result = parser("")
+            assert result.status == "failed", parser.__name__
+            assert result.data == {}
             assert "raw" in result, f"{parser.__name__} failed on empty input"
 
     def test_all_no_exception_on_garbage(self):
-        parsers = [
-            parse_registers, parse_stack_k, parse_stack_kp,
-            parse_disassembly, parse_memory_dump, parse_modules,
-            parse_symbol_list, parse_nearest_symbol, parse_type_info,
-            parse_evaluate, parse_analyze, parse_process_list,
-            parse_thread_list_user, parse_thread_list_kernel, parse_breakpoints,
-        ]
         garbage = "!@#$%^&*()_+\nnothing\n12345\n"
-        for parser in parsers:
+        for parser in ALL_PARSERS:
             try:
                 result = parser(garbage)
-                assert isinstance(result, dict), f"{parser.__name__} returned non-dict"
+                assert isinstance(result, ParseResult)
+                assert result.status == "failed", parser.__name__
+                assert result.unparsed_lines == ("!@#$%^&*()_+", "nothing", "12345")
             except Exception as e:
                 assert False, f"{parser.__name__} raised {e} on garbage input"
