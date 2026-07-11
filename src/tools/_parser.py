@@ -631,6 +631,10 @@ _RE_MODULE_LINE = re.compile(
 )
 
 _RE_MODULE_HEADER = re.compile(r"start\s+end\s+module name", re.IGNORECASE)
+_RE_UNLOADED_MODULE_HEADER = re.compile(
+    r"^\s*Unloaded modules:\s*$",
+    re.IGNORECASE,
+)
 
 
 def parse_modules(raw: str) -> ParseResult:
@@ -650,6 +654,9 @@ def parse_modules(raw: str) -> ParseResult:
         if _RE_MODULE_HEADER.search(line):
             header_seen = True
             continue
+
+        if _RE_UNLOADED_MODULE_HEADER.fullmatch(line):
+            break
 
         if not header_seen:
             unparsed_lines.append(line)
@@ -733,7 +740,7 @@ _RE_LN_SYMBOL = re.compile(
 )
 
 _RE_LN_HEADER = re.compile(
-    r"^(?:Browse module|Set b[up] breakpoint)$",
+    r"^(?:Browse module|Set b[up] breakpoint|Exact matches:)$",
     re.IGNORECASE,
 )
 

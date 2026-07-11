@@ -43,6 +43,11 @@ _SYSTEM_DUMP = re.compile(
 _SYSTEM_LIVE = re.compile(
     r"(?im)^\s*[.#]\s+\d+\s+live\b[^\r\n]*:"
 )
+_SYSTEM_REMOTE_LIVE = re.compile(
+    r"(?im)^\s*(?:(?:\d+:\s*)?kd>\s*)?[.#]\s+\d+\s+"
+    r"remote\s+kd\s*:\s*"
+    r"kdsrv\s*:[^\r\n]*\btarget\b[^\r\n]*$"
+)
 
 
 def _target_mode(*raw_values: str) -> str:
@@ -73,9 +78,10 @@ def _session_kind(*raw_values: str) -> str:
         text,
     ):
         return "dump"
-    if _SYSTEM_LIVE.search(text) or re.search(
-        r"(?i)\blive\s+(?:user|kernel)\s+mode\b",
-        text,
+    if (
+        _SYSTEM_LIVE.search(text)
+        or _SYSTEM_REMOTE_LIVE.search(text)
+        or re.search(r"(?i)\blive\s+(?:user|kernel)\s+mode\b", text)
     ):
         return "live"
     return "unknown"

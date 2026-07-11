@@ -10,7 +10,7 @@ from tools import _registry
 from tools._models import ToolEnvelope
 from tools.analyze_tool import register_analyze_tool
 from tools.breakpoint_tool import register_breakpoint_tool
-from tools.context_tool import register_context_tool
+from tools.context_tool import _session_kind, register_context_tool
 from tools.control_tool import register_control_tool
 from tools.disasm_tool import register_disasm_tool
 from tools.eval_tool import register_eval_tool
@@ -54,6 +54,10 @@ SYSTEM_USER_LIVE = ".  0 Live user mode: <Local>"
 SYSTEM_USER_DUMP = ".  0 64-bit User mini dump: C:\\dumps\\notepad.dmp"
 SYSTEM_KERNEL_LIVE = ".  0 Live kernel mode: NET:port=50000"
 SYSTEM_KERNEL_DUMP = ".  0 64-bit Kernel bitmap dump: C:\\dumps\\memory.dmp"
+SYSTEM_KERNEL_REMOTE = (
+    "1: kd> .  0 Remote KD: KdSrv:Server=@{<Local>},"
+    "Trans=@{NET:Port=50000,Key=1.2.3.4,Target}"
+)
 FRAME_SELECTED_5 = (
     "05 000000d1`47e7f400 00007fff`e5a4d83a     "
     "ntdll!LdrpDoDebuggerBreak+0x35"
@@ -614,6 +618,15 @@ def test_symbol_reload_never_verifies_deferred_or_missing_module_state(
         ),
         (
             VERTARGET_KERNEL,
+            SYSTEM_KERNEL_REMOTE,
+            "kernel",
+            "live",
+            "!running -ti",
+            THREADS_KERNEL,
+            "kernel_running",
+        ),
+        (
+            VERTARGET_KERNEL,
             SYSTEM_KERNEL_DUMP,
             "kernel",
             "dump",
@@ -656,6 +669,14 @@ def test_context_routes_real_user_kernel_and_live_dump_forms(
     assert result.inferences[1].value == expected_route
     assert executor.calls[-1]["command"] == thread_command
     executor.assert_done()
+
+
+def test_session_kind_recognizes_remote_kd_target_as_live():
+    assert _session_kind(SYSTEM_KERNEL_REMOTE) == "live"
+
+
+def test_session_kind_keeps_dump_priority_over_remote_live_evidence():
+    assert _session_kind(SYSTEM_KERNEL_REMOTE, SYSTEM_KERNEL_DUMP) == "dump"
 
 
 def test_crash_analysis_uses_exception_context_only_for_user_dump(toolset, monkeypatch):

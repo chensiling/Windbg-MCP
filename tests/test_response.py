@@ -52,6 +52,59 @@ class TestResponseEnvelope:
         assert result.sources[0].raw == "r"
         assert result.raw == "r"
 
+    def test_source_item_bounds_async_output_but_preserves_engine_evidence(self):
+        async_output = "HEAD:" + ("x" * 2_500) + ":TAIL"
+        execution = ExecutionResult(
+            status="completed",
+            output="command output",
+            complete=True,
+            async_output=async_output,
+        )
+
+        source = source_item("r", execution)
+
+        assert len(source.async_output) == 2_000
+        assert source.async_output.startswith("HEAD:")
+        assert source.async_output.endswith(":TAIL")
+        assert "...[ASYNC OUTPUT TRUNCATED]..." in source.async_output
+        assert source.warnings == ["async_output_truncated"]
+        assert execution.async_output == async_output
+
+    def test_source_item_preserves_short_async_output(self):
+        execution = ExecutionResult(
+            status="completed",
+            output="command output",
+            complete=True,
+            async_output="short asynchronous output",
+        )
+
+        source = source_item("r", execution)
+
+        assert source.async_output == "short asynchronous output"
+        assert source.warnings == []
+
+    def test_source_item_merges_parse_and_async_output_warnings(self):
+        execution = ExecutionResult(
+            status="completed",
+            output="parsed output\nextra",
+            complete=True,
+            async_output="a" * 2_001,
+        )
+        parsed = ParseResult(
+            "partial",
+            {"value": "0x1"},
+            execution.output,
+            ["extra"],
+            ["unparsed_lines"],
+        )
+
+        source = source_item("? 1", execution, parsed)
+
+        assert source.warnings == [
+            "unparsed_lines",
+            "async_output_truncated",
+        ]
+
     @pytest.mark.parametrize(
         ("parse_status", "expected_ok"),
         [("complete", True), ("partial", False), ("failed", False)],

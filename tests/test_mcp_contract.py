@@ -150,8 +150,20 @@ async def test_runtime_discovery_exposes_descriptions_schemas_and_annotations():
     assert tools["windbg_exec"].outputSchema is None
 
 
-class _RawExecutor:
+class _ContractExecutor:
     def execute(self, command, *, read_only=False, retryable=False):
+        if command == "? @rip":
+            assert read_only is True
+            assert retryable is True
+            return ExecutionResult(
+                status="completed",
+                output=(
+                    "Evaluate expression: 140709204350861 = "
+                    "00007ff9`850bd78d"
+                ),
+                complete=True,
+            )
+
         assert command == "r"
         assert read_only is False
         assert retryable is False
@@ -166,7 +178,7 @@ class _RawExecutor:
 async def test_runtime_calls_return_direct_envelope_and_explicit_raw_content(
     monkeypatch,
 ):
-    monkeypatch.setattr(_registry, "_executor", _RawExecutor())
+    monkeypatch.setattr(_registry, "_executor", _ContractExecutor())
     mcp = create_mcp_server()
 
     async with create_connected_server_and_client_session(
@@ -174,7 +186,7 @@ async def test_runtime_calls_return_direct_envelope_and_explicit_raw_content(
     ) as session:
         business_result = await session.call_tool(
             "windbg_evaluate",
-            {"expression": "@rip; g"},
+            {"expression": "@rip"},
         )
         raw_result = await session.call_tool("windbg_exec", {"command": "r"})
 
@@ -182,7 +194,22 @@ async def test_runtime_calls_return_direct_envelope_and_explicit_raw_content(
     assert structured is not None
     assert set(structured) == ENVELOPE_FIELDS
     assert structured["tool"] == "windbg_evaluate"
-    assert structured["ok"] is False
+    assert structured["ok"] is True
+    assert structured["execution_status"] == "completed"
+    assert structured["parse_status"] == "complete"
+    assert structured["verification_status"] == "not_required"
+    assert structured["data"] == {
+        "input": "@rip",
+        "value": "0x00007ff9850bd78d",
+        "decimal": "140709204350861",
+    }
+    assert len(structured["sources"]) == 1
+    source = structured["sources"][0]
+    assert source["command"] == "? @rip"
+    assert source["execution_status"] == "completed"
+    assert source["parse_status"] == "complete"
+    assert source["complete"] is True
+    assert source["warnings"] == []
     assert json.loads(business_result.content[0].text) == structured
 
     assert raw_result.structuredContent is None

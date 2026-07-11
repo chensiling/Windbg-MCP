@@ -116,6 +116,14 @@ SAMPLE_MEM_ASCII = '''00000000`0012f000  "Hello, w"
 SAMPLE_MODULES = """start             end                 module name
 00007ff9`84fa0000 00007ff9`85206000   ntdll      (pdb symbols)          C:\\ProgramData\\dbg\\sym\\ntdll.pdb\\23ADECD9479F123BF50906CE9B88193F1\\ntdll.pdb"""
 
+SAMPLE_MODULES_WITH_UNLOADED = """1: kd> start             end                 module name
+fffff807`7de00000 fffff807`7f250000   nt         (pdb symbols)          C:\\ProgramData\\Dbg\\sym\\ntkrnlmp.pdb
+fffff807`7f600000 fffff807`7f606000   hal        (deferred)
+
+Unloaded modules:
+fffff807`14a60000 fffff807`14a80000   NetworkPrivacyPolicy.sys
+fffff807`12d20000 fffff807`12d3a000   dump_storport.sys"""
+
 SAMPLE_SYMBOLS = """00007ff9`84fb00f0 ntdll!LdrpDoPostSnapWork (void)
 00007ff9`850bd758 ntdll!LdrpDoDebuggerBreak (LdrpDoDebuggerBreak)"""
 
@@ -123,6 +131,12 @@ SAMPLE_LN = """Browse module
 Set bu breakpoint
 
 (00007ff9`850bd758)   ntdll!LdrpDoDebuggerBreak+0x35   |  (00007ff9`850bd790)   ntdll!LdrpDoDebuggerBreak+0x68"""
+
+SAMPLE_LN_EXACT_MATCHES = """1: kd> Browse module
+Set bu breakpoint
+
+(fffff807`7e2f90d0)   nt!DbgBreakPointWithStatus   |  (fffff807`7e2f90d2)   nt!DbgBreakPointWithStatusEnd
+Exact matches:"""
 
 SAMPLE_TYPE_INFO = """   +0x000 NtTib            : _NT_TIB
    +0x038 EnvironmentPointer : Ptr64 Void
@@ -404,6 +418,16 @@ class TestParseModules:
         result = parse_modules("no module here")
         assert result["raw"] == "no module here"
 
+    def test_unloaded_section_is_known_but_not_returned_as_loaded(self):
+        result = parse_modules(SAMPLE_MODULES_WITH_UNLOADED)
+
+        assert result.status == "complete"
+        assert [module["name"] for module in result.data["modules"]] == [
+            "nt",
+            "hal",
+        ]
+        assert result.raw == SAMPLE_MODULES_WITH_UNLOADED
+
 
 class TestParseSymbolList:
     def test_parse(self):
@@ -436,6 +460,16 @@ class TestParseNearestSymbol:
     def test_empty(self):
         result = parse_nearest_symbol("no symbol")
         assert result["raw"] == "no symbol"
+
+    def test_exact_matches_heading_is_known_output(self):
+        result = parse_nearest_symbol(SAMPLE_LN_EXACT_MATCHES)
+
+        assert result.status == "complete"
+        assert [symbol["name"] for symbol in result.data["symbols"]] == [
+            "nt!DbgBreakPointWithStatus",
+            "nt!DbgBreakPointWithStatusEnd",
+        ]
+        assert result.raw == SAMPLE_LN_EXACT_MATCHES
 
     def test_same_line_unmatched_content_is_partial(self):
         raw = (

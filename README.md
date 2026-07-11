@@ -190,7 +190,7 @@ http://127.0.0.1:8080/mcp
 | `windbg_disassemble(at, count?)` | 反汇编 | 解析 `u` 输出和符号标签。`count` 支持十进制、`0x` 十六进制和 `10h` 形式。 |
 | `windbg_evaluate(expression)` | 表达式求值 | 解析 `? expression` 输出，返回十进制和十六进制结果。 |
 | `windbg_lookup(what, kind?)` | 符号/类型/地址解析 | `kind` 可显式选择 `address`、`symbol` 或 `type`；`auto` 路由会作为 inference 返回。 |
-| `windbg_read_memory(address, size?, format?)` | 读取内存 | `format` 支持 `auto`、`byte`、`word`、`dword`、`qword`、`ascii`。 |
+| `windbg_read_memory(address, size?, format?)` | 读取内存 | `format` 支持 `auto`、`byte`、`word`、`dword`、`qword`、`ascii`。`size` 是所选 `format` 的元素数量，不是字节数；例如 `size="4", format="qword"` 读取 4 个 qword（共 32 字节）。 |
 | `windbg_write_memory(address, values)` | 写入字节 | 使用 `eb` 写入，并将读回地址、连续范围和字节全部绑定后才报告 verified。 |
 | `windbg_breakpoint(action, ...)` | 断点管理 | `action` 支持 `set`、`list`、`clear`、`enable`、`disable`；所有变更通过 `bl` 前后状态验证。 |
 | `windbg_control(action, count?)` | 执行控制 | `action` 支持 `go`、`step_into`、`step_over`、`step_out`。会改变目标运行状态。 |

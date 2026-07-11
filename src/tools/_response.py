@@ -22,6 +22,26 @@ except ImportError:  # Tests may import tools as a top-level package.
     from debugger.engine import ExecutionResult
 
 
+_ASYNC_OUTPUT_LIMIT = 2_000
+_ASYNC_OUTPUT_TRUNCATION_MARKER = "\n...[ASYNC OUTPUT TRUNCATED]...\n"
+_ASYNC_OUTPUT_TRUNCATION_WARNING = "async_output_truncated"
+
+
+def _limit_async_output(output: str) -> tuple[str, bool]:
+    if len(output) <= _ASYNC_OUTPUT_LIMIT:
+        return output, False
+
+    retained = _ASYNC_OUTPUT_LIMIT - len(_ASYNC_OUTPUT_TRUNCATION_MARKER)
+    head_length = (retained + 1) // 2
+    tail_length = retained - head_length
+    return (
+        output[:head_length]
+        + _ASYNC_OUTPUT_TRUNCATION_MARKER
+        + output[-tail_length:],
+        True,
+    )
+
+
 def error_item(
     code: str,
     message: str,
@@ -50,6 +70,16 @@ def source_item(
     execution: ExecutionResult,
     parsed: ParseResult | None = None,
 ) -> ToolSource:
+    async_output, async_output_truncated = _limit_async_output(
+        execution.async_output,
+    )
+    warnings = list(parsed.warnings) if parsed is not None else []
+    if (
+        async_output_truncated
+        and _ASYNC_OUTPUT_TRUNCATION_WARNING not in warnings
+    ):
+        warnings.append(_ASYNC_OUTPUT_TRUNCATION_WARNING)
+
     return ToolSource(
         command=command,
         execution_status=execution.status,
@@ -58,10 +88,10 @@ def source_item(
         error=execution.error,
         attempts=execution.attempts,
         session_restarted=execution.session_restarted,
-        async_output=execution.async_output,
+        async_output=async_output,
         parse_status=parsed.status if parsed is not None else "not_run",
         unparsed_lines=list(parsed.unparsed_lines) if parsed is not None else [],
-        warnings=list(parsed.warnings) if parsed is not None else [],
+        warnings=warnings,
     )
 
 

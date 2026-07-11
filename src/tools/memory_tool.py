@@ -70,7 +70,7 @@ def register_memory_tool(mcp):
         size: str = "0x20",
         format: MemoryFormat = "auto",
     ) -> ToolEnvelope:
-        """Resolve an address and return a bounded parsed memory observation."""
+        """Read `size` selected-format elements; `size` is not a byte count."""
 
         input_error = validate_intent_text(address, "address")
         if input_error:
