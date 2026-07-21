@@ -70,9 +70,11 @@ class ParseResult(dict[str, Any]):
 _RE_DEBUGGER_PROMPT = re.compile(r"^\s*(?:(?:\d+:\s*)?[^>\s]+)>\s*")
 _RE_DEBUGGER_COMMAND = re.compile(
     r"(?:r(?:\s+.*)?|k[bcpvlnf]*(?:\s+.*)?|u[a-z]?(?:\s+.*)?|"
-    r"d[abuwdq](?:\s+.*)?|lm(?:\s+.*)?|x\s+.+|ln\s+.+|dt\s+.+|"
+    r"d[abuwdq](?:\s+.*)?|lm[a-z]*(?:\s+.*)?|x\s+.+|ln\s+.+|dt\s+.+|"
     r"\?\s+.+|!analyze(?:\s+.*)?|!process(?:\s+.*)?|~(?:\s+.*)?|"
-    r"bl(?:\s+.*)?|!running(?:\s+.*)?|\.frame(?:\s+.*)?)",
+    r"bl(?:\s+.*)?|!running(?:\s+.*)?|\.frame(?:\s+.*)?|\.fnent(?:\s+.*)?|"
+    r"!thread(?:\s+.*)?|!pte(?:\s+.*)?|!pool(?:\s+.*)?|"
+    r"!blackbox(?:pnp|ntfs|winlogon)(?:\s+.*)?|!chkimg(?:\s+.*)?)",
     re.IGNORECASE,
 )
 
@@ -122,9 +124,10 @@ def _parse_result(
             warnings=normalized_warnings,
         )
 
-    if normalized_unparsed:
+    if normalized_unparsed or normalized_warnings:
         if "unparsed_lines" not in normalized_warnings:
-            normalized_warnings.append("unparsed_lines")
+            if normalized_unparsed:
+                normalized_warnings.append("unparsed_lines")
         return ParseResult(
             status="partial",
             data=data,
@@ -153,6 +156,105 @@ def _failed(raw: str, warnings: list[str] | None = None) -> ParseResult:
 
 
 # ---------------------------------------------------------------------------
+# parse_target_info — classify live targets and dump capabilities
+# ---------------------------------------------------------------------------
+
+_RE_KERNEL_TARGET = re.compile(
+    r"(?:\bkernel\b|(?:\d+:\s*)?kd>|kernel base\s*=|psloadedmodulelist\s*=)",
+    re.IGNORECASE,
+)
+_RE_USER_TARGET = re.compile(
+    r"(?:\buser mode\b|\buser (?:mini )?dump\b|process uptime\s*:|"
+    r"\d+:[0-9a-f]+(?::(?:x86|amd64|arm|arm64))?>)",
+    re.IGNORECASE,
+)
+
+
+def parse_target_info(raw: str) -> ParseResult:
+    """Classify target mode, session kind, and mechanically known capabilities."""
+
+    if not raw or not raw.strip():
+        return _failed(raw)
+
+    text = raw.lower()
+    target_mode = "unknown"
+    if _RE_KERNEL_TARGET.search(raw):
+        target_mode = "kernel"
+    elif _RE_USER_TARGET.search(raw):
+        target_mode = "user"
+
+    session_kind = "unknown"
+    if re.search(r"\bkernel triage dump\b", text):
+        session_kind = "kernel_triage_dump"
+        target_mode = "kernel"
+    elif re.search(r"\bkernel (?:mini|minidump) dump\b|\bkernel minidump\b", text):
+        session_kind = "kernel_mini_dump"
+        target_mode = "kernel"
+    elif re.search(r"\bcomplete memory dump\b", text):
+        session_kind = "complete_memory_dump"
+        target_mode = "kernel"
+    elif re.search(r"\bkernel (?:bitmap |memory )?dump\b", text):
+        session_kind = "kernel_memory_dump"
+        target_mode = "kernel"
+    elif re.search(r"\buser(?: mini)? dump\b|\buser mode dump\b", text):
+        session_kind = "user_dump"
+        target_mode = "user"
+    elif (
+        re.search(r"\blive kernel mode\b", text)
+        or re.search(r"\bremote kd\b.*\btarget\b", text, re.DOTALL)
+    ):
+        session_kind = "live_kernel"
+        target_mode = "kernel"
+    elif re.search(r"\blive user mode\b", text):
+        session_kind = "live_user"
+        target_mode = "user"
+
+    if target_mode == "unknown" and session_kind == "unknown":
+        return _failed(raw)
+
+    if session_kind == "unknown":
+        capabilities = {
+            "is_live": None,
+            "is_dump": None,
+            "can_resume": None,
+            "has_complete_memory": None,
+            "captured_memory_limited": None,
+            "supports_kernel_pool": None,
+        }
+        warnings = ["session_kind_unknown"]
+    else:
+        is_live = session_kind in ("live_user", "live_kernel")
+        capabilities = {
+            "is_live": is_live,
+            "is_dump": session_kind.endswith("_dump"),
+            "can_resume": is_live,
+            "has_complete_memory": session_kind == "complete_memory_dump",
+            "captured_memory_limited": session_kind in (
+                "user_dump",
+                "kernel_mini_dump",
+                "kernel_triage_dump",
+                "kernel_memory_dump",
+            ),
+            "supports_kernel_pool": session_kind in (
+                "live_kernel",
+                "kernel_memory_dump",
+                "complete_memory_dump",
+            ),
+        }
+        warnings = []
+    return _parse_result(
+        raw,
+        {
+            "target_mode": target_mode,
+            "session_kind": session_kind,
+            "capabilities": capabilities,
+        },
+        [],
+        warnings=warnings,
+    )
+
+
+# ---------------------------------------------------------------------------
 # parse_registers — 解析 "r" 输出
 # ---------------------------------------------------------------------------
 
@@ -172,9 +274,13 @@ _RE_CUR_SYM = re.compile(
     r"^\s*(?P<symbol>\S+!?\S+):\s*$"
 )
 
-_RE_CUR_ADDR = re.compile(
-    r"^\s*(?P<address>[0-9a-f`]+)\s+(?P<bytes>[0-9a-f ]+)\s+(?P<insn>.+)$"
+_RE_INSTRUCTION_LINE = re.compile(
+    r"^\s*(?P<address>[0-9a-f`]+)\s+"
+    r"(?P<bytes>(?:[0-9a-f]{2}\s*)+?)\s+"
+    r"(?P<insn>[a-z].*)$",
+    re.IGNORECASE,
 )
+_RE_CUR_ADDR = _RE_INSTRUCTION_LINE
 
 
 def parse_registers(raw: str) -> ParseResult:
@@ -437,12 +543,15 @@ def parse_frame_selection(raw: str) -> ParseResult:
 # parse_disassembly — 解析 "u" 反汇编输出
 # ---------------------------------------------------------------------------
 
-_RE_DISASM_ADDR = re.compile(
-    r"^\s*(?P<address>[0-9a-f`]+)\s+(?P<bytes>[0-9a-f ]+?)\s{2,}(?P<insn>.+)$",
-    re.IGNORECASE,
-)
+_RE_DISASM_ADDR = _RE_INSTRUCTION_LINE
 
 _RE_DISASM_LABEL = re.compile(r"^\s*(?P<symbol>\S+):\s*$")
+_RE_MEMORY_ACCESS_ERROR = re.compile(
+    r"(?:memory access error|unable to read memory|"
+    r"unable to get mi(?:visible)?state|"
+    r"\?{4,}`?\?{4,})",
+    re.IGNORECASE,
+)
 
 
 def parse_disassembly(raw: str) -> ParseResult:
@@ -453,10 +562,16 @@ def parse_disassembly(raw: str) -> ParseResult:
     instructions: list[dict[str, str]] = []
     current_label: str | None = None
     unparsed_lines: list[str] = []
+    warnings: list[str] = []
 
     for raw_line in raw.splitlines():
         line = _clean_line(raw_line)
         if not line.strip():
+            continue
+
+        if _RE_MEMORY_ACCESS_ERROR.search(line):
+            if "memory_access_error" not in warnings:
+                warnings.append("memory_access_error")
             continue
 
         # 标签行: "ntdll!LdrpDoDebuggerBreak+0x35:"
@@ -484,14 +599,19 @@ def parse_disassembly(raw: str) -> ParseResult:
 
         unparsed_lines.append(line)
 
-    result: dict[str, Any] = {"instructions": instructions}
+    result: dict[str, Any] = {
+        "instructions": instructions,
+        "available": bool(instructions),
+        "complete_range": "memory_access_error" not in warnings,
+    }
     if current_label:
         result["label"] = current_label
     return _parse_result(
         raw,
-        result if instructions else {},
+        result if instructions or warnings else {},
         unparsed_lines,
-        recognized=bool(instructions),
+        recognized=bool(instructions or warnings),
+        warnings=warnings,
     )
 
 
@@ -512,6 +632,16 @@ _MEMORY_FORMAT_BY_WIDTH = {
 }
 
 _RE_MEMORY_ASCII = re.compile(r'^"(?P<text>.*)"$')
+
+
+def _available_memory_prefix(data_part: str) -> tuple[str | None, bool]:
+    hex_part = re.split(r"\s{2,}", data_part.rstrip(), maxsplit=1)[0]
+    tokens = hex_part.replace("-", " ").split()
+    for index, token in enumerate(tokens):
+        if len(token) in (2, 4, 8, 16) and set(token) == {"?"}:
+            prefix = tokens[:index]
+            return (" ".join(prefix) if prefix else None), True
+    return data_part, False
 
 
 def _parse_memory_line(data_part: str) -> tuple[str, int, list[str], str] | None:
@@ -556,6 +686,11 @@ def parse_memory_dump(raw: str) -> ParseResult:
         if not line.strip():
             continue
 
+        if _RE_MEMORY_ACCESS_ERROR.search(line):
+            if "memory_access_error" not in warnings:
+                warnings.append("memory_access_error")
+            continue
+
         m = _RE_MEM_ADDR_LINE.match(line)
         if not m:
             unparsed_lines.append(line)
@@ -563,6 +698,13 @@ def parse_memory_dump(raw: str) -> ParseResult:
 
         addr = m.group("address").lower().replace("`", "")
         data_part = m.group("data").strip()
+        available_data, unavailable = _available_memory_prefix(data_part)
+        if unavailable:
+            if "memory_access_error" not in warnings:
+                warnings.append("memory_access_error")
+            if available_data is None:
+                continue
+            data_part = available_data
         ascii_match = _RE_MEMORY_ASCII.fullmatch(data_part)
         if ascii_match:
             ascii_part = ascii_match.group("text")
@@ -611,12 +753,14 @@ def parse_memory_dump(raw: str) -> ParseResult:
         "address": base_address,
         "format": format_type,
         "data": entries,
-    } if entries else {}
+        "available": bool(entries),
+        "complete_range": "memory_access_error" not in warnings,
+    } if entries or warnings else {}
     return _parse_result(
         raw,
         data,
         unparsed_lines,
-        recognized=bool(entries),
+        recognized=bool(entries or warnings),
         warnings=warnings,
     )
 
@@ -693,19 +837,38 @@ _RE_SYMBOL_LINE = re.compile(
     r"^\s*(?P<address>[0-9a-f`]+)\s+(?P<symbol>\S+)\s*(?P<rest>.*)$",
     re.IGNORECASE,
 )
+_RE_SYMBOL_NOT_FOUND = re.compile(
+    r"^\^?\s*Couldn't resolve\s+.+$",
+    re.IGNORECASE,
+)
 
 
 def parse_symbol_list(raw: str) -> ParseResult:
     """解析 'x' 输出，返回 {symbols: [{address, name, info?}]}"""
     if not raw or not raw.strip():
-        return _failed(raw)
+        return ParseResult(
+            status="complete",
+            data={"found": False, "symbols": []},
+            raw=raw,
+            unparsed_lines=[],
+            warnings=[],
+        )
 
     symbols: list[dict[str, str]] = []
     unparsed_lines: list[str] = []
+    prompt_seen = False
+    not_found_seen = False
 
     for raw_line in raw.splitlines():
+        prompt_seen = prompt_seen or _RE_DEBUGGER_PROMPT.match(raw_line) is not None
         line = _clean_line(raw_line)
         if not line.strip():
+            continue
+        if (
+            _RE_LN_NOT_FOUND.fullmatch(line.strip())
+            or _RE_SYMBOL_NOT_FOUND.fullmatch(line.strip())
+        ):
+            not_found_seen = True
             continue
 
         m = _RE_SYMBOL_LINE.match(line)
@@ -722,11 +885,16 @@ def parse_symbol_list(raw: str) -> ParseResult:
             sym["info"] = rest
         symbols.append(sym)
 
+    data: dict[str, Any] = {}
+    if symbols:
+        data = {"found": True, "symbols": symbols}
+    elif not unparsed_lines and (prompt_seen or not_found_seen):
+        data = {"found": False, "symbols": []}
     return _parse_result(
         raw,
-        {"symbols": symbols} if symbols else {},
+        data,
         unparsed_lines,
-        recognized=bool(symbols),
+        recognized=bool(data),
     )
 
 
@@ -743,18 +911,34 @@ _RE_LN_HEADER = re.compile(
     r"^(?:Browse module|Set b[up] breakpoint|Exact matches:)$",
     re.IGNORECASE,
 )
+_RE_LN_NOT_FOUND = re.compile(
+    r"^(?:no matching symbols found\.?|no symbols found\.?)$",
+    re.IGNORECASE,
+)
 
 
 def parse_nearest_symbol(raw: str) -> ParseResult:
     """解析 'ln address' 输出，返回 {symbol: {address, name}}"""
     if not raw or not raw.strip():
-        return _failed(raw)
+        return ParseResult(
+            status="complete",
+            data={"found": False, "symbols": []},
+            raw=raw,
+            unparsed_lines=[],
+            warnings=[],
+        )
 
     symbols: list[dict[str, str]] = []
     unparsed_lines: list[str] = []
+    prompt_seen = False
+    not_found_seen = False
     for raw_line in raw.splitlines():
+        prompt_seen = prompt_seen or _RE_DEBUGGER_PROMPT.match(raw_line) is not None
         line = _clean_line(raw_line).strip()
         if not line or _RE_LN_HEADER.fullmatch(line):
+            continue
+        if _RE_LN_NOT_FOUND.fullmatch(line):
+            not_found_seen = True
             continue
 
         matches = list(_RE_LN_SYMBOL.finditer(line))
@@ -772,12 +956,14 @@ def parse_nearest_symbol(raw: str) -> ParseResult:
 
     data: dict[str, Any] = {}
     if symbols:
-        data = {"symbol": symbols[0], "symbols": symbols}
+        data = {"found": True, "symbol": symbols[0], "symbols": symbols}
+    elif not unparsed_lines and (prompt_seen or not_found_seen):
+        data = {"found": False, "symbols": []}
     return _parse_result(
         raw,
         data,
         unparsed_lines,
-        recognized=bool(symbols),
+        recognized=bool(symbols) or bool(data),
     )
 
 
@@ -1278,4 +1464,443 @@ def parse_thread_list_kernel(raw: str) -> ParseResult:
         result if processors else {},
         unparsed_lines,
         recognized=bool(processors),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Focused read-only kernel diagnostic parsers
+# ---------------------------------------------------------------------------
+
+_RE_THREAD_INFO_HEADER = re.compile(
+    r"^\s*THREAD\s+(?P<address>[0-9a-f`]+)"
+    r"(?:\s+Cid\s+(?P<cid>[0-9a-f.]+))?",
+    re.IGNORECASE,
+)
+_RE_THREAD_OWNER = re.compile(
+    r"^\s*Owning Process\s+(?P<address>[0-9a-f`]+)"
+    r"(?:\s+Image:\s*(?P<image>\S+))?",
+    re.IGNORECASE,
+)
+_RE_THREAD_PRIORITY = re.compile(
+    r"^\s*Priority\s+(?P<priority>\d+)\s+"
+    r"BasePriority\s+(?P<base_priority>\d+)",
+    re.IGNORECASE,
+)
+
+
+def parse_thread_info(raw: str) -> ParseResult:
+    if not raw or not raw.strip():
+        return _failed(raw)
+
+    thread: dict[str, Any] = {}
+    stack: list[dict[str, str]] = []
+    unparsed_lines: list[str] = []
+    warnings: list[str] = []
+
+    for raw_line in raw.splitlines():
+        line = _clean_line(raw_line)
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _RE_MEMORY_ACCESS_ERROR.search(stripped):
+            if "target_data_unavailable" not in warnings:
+                warnings.append("target_data_unavailable")
+            continue
+
+        match = _RE_THREAD_INFO_HEADER.match(stripped)
+        if match:
+            thread["address"] = _canonical_hex(match.group("address"))
+            if match.group("cid"):
+                thread["cid"] = match.group("cid")
+            if "WAIT:" in stripped.upper():
+                thread["state"] = "wait"
+            continue
+
+        match = _RE_THREAD_OWNER.match(stripped)
+        if match:
+            thread["owning_process"] = _canonical_hex(match.group("address"))
+            if match.group("image"):
+                thread["process_image"] = match.group("image")
+            continue
+
+        match = _RE_THREAD_PRIORITY.match(stripped)
+        if match:
+            thread["priority"] = int(match.group("priority"))
+            thread["base_priority"] = int(match.group("base_priority"))
+            continue
+
+        if _RE_STACK_HEADER.search(stripped):
+            continue
+        match = _RE_STACK_LINE.match(stripped)
+        if match:
+            frame = {
+                "child_sp": _canonical_hex(match.group("child_sp")),
+                "ret_addr": _canonical_hex(match.group("ret_addr")),
+                "call_site": match.group("call_site").strip(),
+            }
+            if match.group("index") is not None:
+                frame["index"] = match.group("index")
+            stack.append(frame)
+            continue
+
+        unparsed_lines.append(stripped)
+
+    if warnings and not thread:
+        return _parse_result(
+            raw,
+            {"available": False, "thread": {}, "stack": []},
+            unparsed_lines,
+            warnings=warnings,
+        )
+    data = {
+        "available": bool(thread),
+        "thread": thread,
+        "stack": stack,
+    } if thread else {}
+    return _parse_result(
+        raw,
+        data,
+        unparsed_lines,
+        recognized=bool(thread),
+        warnings=warnings,
+    )
+
+
+_RE_MODULE_DETAIL_RANGE = re.compile(
+    r"^\s*(?P<start>[0-9a-f`]+)\s+(?P<end>[0-9a-f`]+)\s+"
+    r"(?P<name>\S+)(?:\s+(?P<info>.*))?$",
+    re.IGNORECASE,
+)
+_RE_DETAIL_FIELD = re.compile(r"^\s*(?P<key>[A-Za-z][A-Za-z ]+):\s*(?P<value>.*)$")
+
+
+def _field_name(value: str) -> str:
+    with_boundaries = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value.strip())
+    return re.sub(r"[^a-z0-9]+", "_", with_boundaries.lower()).strip("_")
+
+
+def parse_module_info(raw: str) -> ParseResult:
+    if not raw or not raw.strip():
+        return _failed(raw)
+
+    module: dict[str, Any] = {}
+    unparsed_lines: list[str] = []
+    header_seen = False
+    for raw_line in raw.splitlines():
+        line = _clean_line(raw_line)
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _RE_MODULE_HEADER.search(stripped) or stripped.lower() == "browse full module list":
+            header_seen = True
+            continue
+
+        range_match = _RE_MODULE_DETAIL_RANGE.match(stripped)
+        if header_seen and range_match:
+            module.update({
+                "start": _canonical_hex(range_match.group("start")),
+                "end": _canonical_hex(range_match.group("end")),
+                "name": range_match.group("name"),
+            })
+            info = (range_match.group("info") or "").strip()
+            if info:
+                module["symbol_status"] = info
+            continue
+
+        field_match = _RE_DETAIL_FIELD.match(stripped)
+        if field_match:
+            module[_field_name(field_match.group("key"))] = (
+                field_match.group("value").strip()
+            )
+            continue
+        if stripped.lower().startswith("browse all global symbols"):
+            continue
+        unparsed_lines.append(stripped)
+
+    data: dict[str, Any] = {}
+    if module:
+        data = {"found": True, "module": module}
+    elif header_seen and not unparsed_lines:
+        data = {"found": False, "module": {}}
+    return _parse_result(
+        raw,
+        data,
+        unparsed_lines,
+        recognized=bool(data),
+    )
+
+
+_RE_PTE_VA = re.compile(r"\bVA\s+(?P<address>[0-9a-f`]+)", re.IGNORECASE)
+_RE_PTE_LOCATION = re.compile(
+    r"\b(?P<level>PXE|PPE|PDE|PTE)\s+at\s+(?P<address>[0-9a-f`]+)",
+    re.IGNORECASE,
+)
+_RE_PTE_VALUE = re.compile(r"\bcontains\s+(?P<value>[0-9a-f`]+)", re.IGNORECASE)
+_RE_PTE_PFN = re.compile(
+    r"\bpfn\s+(?P<pfn>[0-9a-f]+)\s+(?P<flags>[-A-Za-z]+)",
+    re.IGNORECASE,
+)
+
+
+def parse_pte(raw: str) -> ParseResult:
+    if not raw or not raw.strip():
+        return _failed(raw)
+
+    data: dict[str, Any] = {"entries": []}
+    locations: list[dict[str, str]] = []
+    values: list[str] = []
+    unparsed_lines: list[str] = []
+    warnings: list[str] = []
+    for raw_line in raw.splitlines():
+        line = _clean_line(raw_line)
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _RE_MEMORY_ACCESS_ERROR.search(stripped):
+            if "target_data_unavailable" not in warnings:
+                warnings.append("target_data_unavailable")
+            continue
+        va_match = _RE_PTE_VA.search(stripped)
+        if va_match:
+            data["virtual_address"] = _canonical_hex(va_match.group("address"))
+        line_locations = list(_RE_PTE_LOCATION.finditer(stripped))
+        if line_locations:
+            locations.extend({
+                "level": match.group("level").upper(),
+                "address": _canonical_hex(match.group("address")),
+            } for match in line_locations)
+            continue
+        line_values = list(_RE_PTE_VALUE.finditer(stripped))
+        if line_values:
+            values.extend(
+                _canonical_hex(match.group("value")) for match in line_values
+            )
+            continue
+        pfn_match = _RE_PTE_PFN.search(stripped)
+        if pfn_match:
+            data["pfn"] = _canonical_hex(pfn_match.group("pfn"))
+            data["flags"] = pfn_match.group("flags")
+            continue
+        if va_match:
+            continue
+        unparsed_lines.append(stripped)
+
+    for index, location in enumerate(locations):
+        entry = dict(location)
+        if index < len(values):
+            entry["value"] = values[index]
+        data["entries"].append(entry)
+    recognized = bool(data.get("virtual_address") or locations or warnings)
+    if warnings:
+        data["available"] = bool(locations)
+    return _parse_result(
+        raw,
+        data if recognized else {},
+        unparsed_lines,
+        recognized=recognized,
+        warnings=warnings,
+    )
+
+
+_RE_POOL_HEADER = re.compile(
+    r"Pool page\s+(?P<address>[0-9a-f`]+)\s+region is\s+(?P<region>.+)$",
+    re.IGNORECASE,
+)
+_RE_POOL_ALLOCATION = re.compile(
+    r"^\s*(?P<selected>\*)?(?P<address>[0-9a-f`]+)\s+"
+    r"size:\s*(?P<size>\S+)\s+previous size:\s*(?P<previous>\S+)\s+"
+    r"\((?P<state>[^)]+)\)\s*\*?(?P<tag>\S+)?",
+    re.IGNORECASE,
+)
+
+
+def parse_pool(raw: str) -> ParseResult:
+    if not raw or not raw.strip():
+        return _failed(raw)
+
+    data: dict[str, Any] = {"allocations": []}
+    unparsed_lines: list[str] = []
+    warnings: list[str] = []
+    for raw_line in raw.splitlines():
+        line = _clean_line(raw_line)
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _RE_MEMORY_ACCESS_ERROR.search(stripped):
+            if "target_data_unavailable" not in warnings:
+                warnings.append("target_data_unavailable")
+            continue
+        header = _RE_POOL_HEADER.search(stripped)
+        if header:
+            data["page"] = _canonical_hex(header.group("address"))
+            data["region"] = header.group("region").strip()
+            continue
+        allocation = _RE_POOL_ALLOCATION.match(stripped)
+        if allocation:
+            data["allocations"].append({
+                "address": _canonical_hex(allocation.group("address")),
+                "size": allocation.group("size"),
+                "previous_size": allocation.group("previous"),
+                "state": allocation.group("state").strip().lower(),
+                "tag": allocation.group("tag") or "",
+                "selected": allocation.group("selected") is not None,
+            })
+            continue
+        unparsed_lines.append(stripped)
+
+    recognized = bool(data["allocations"] or data.get("page") or warnings)
+    if warnings:
+        data["available"] = bool(data["allocations"] or data.get("page"))
+    return _parse_result(
+        raw,
+        data if recognized else {},
+        unparsed_lines,
+        recognized=recognized,
+        warnings=warnings,
+    )
+
+
+_RE_BLACKBOX_ABSENT = re.compile(
+    r"(?:blackbox.*(?:not present|not found|unavailable)|no blackbox data)",
+    re.IGNORECASE,
+)
+_RE_BLACKBOX_FIELD = re.compile(
+    r"^\s*(?P<key>[A-Za-z][A-Za-z0-9 _.-]*)\s*[:=]\s*(?P<value>.*)$"
+)
+
+
+def parse_blackbox(raw: str) -> ParseResult:
+    if not raw or not raw.strip():
+        return _failed(raw)
+    if _RE_BLACKBOX_ABSENT.search(raw):
+        return ParseResult(
+            status="complete",
+            data={"available": False, "fields": {}},
+            raw=raw,
+            unparsed_lines=[],
+            warnings=[],
+        )
+
+    fields: dict[str, str] = {}
+    unparsed_lines: list[str] = []
+    for raw_line in raw.splitlines():
+        line = _clean_line(raw_line)
+        stripped = line.strip()
+        if not stripped or set(stripped) <= {"-", "="}:
+            continue
+        match = _RE_BLACKBOX_FIELD.match(stripped)
+        if match:
+            fields[_field_name(match.group("key"))] = match.group("value").strip()
+            continue
+        unparsed_lines.append(stripped)
+    return _parse_result(
+        raw,
+        {"available": True, "fields": fields} if fields else {},
+        unparsed_lines,
+        recognized=bool(fields),
+    )
+
+
+_RE_CHKIMG_RANGE = re.compile(
+    r"(?P<start>[0-9a-f`]+)-(?P<end>[0-9a-f`]+)\s+"
+    r"(?P<count>\d+)\s+bytes?\s+-\s+(?P<symbol>\S+)",
+    re.IGNORECASE,
+)
+_RE_CHKIMG_BYTES = re.compile(r"\[\s*(?P<expected>[^:\]]+):(?P<actual>[^\]]+)\]")
+_RE_CHKIMG_SUMMARY = re.compile(
+    r"(?P<count>\d+)\s+errors?\s*:\s*(?P<scope>.+)$",
+    re.IGNORECASE,
+)
+
+
+def parse_image_verify(raw: str) -> ParseResult:
+    if not raw or not raw.strip():
+        return _failed(raw)
+
+    mismatches: list[dict[str, Any]] = []
+    summary: dict[str, Any] = {}
+    unparsed_lines: list[str] = []
+    for raw_line in raw.splitlines():
+        line = _clean_line(raw_line)
+        stripped = line.strip()
+        if not stripped:
+            continue
+        range_match = _RE_CHKIMG_RANGE.search(stripped)
+        if range_match:
+            mismatches.append({
+                "start": _canonical_hex(range_match.group("start")),
+                "end": _canonical_hex(range_match.group("end")),
+                "byte_count": int(range_match.group("count")),
+                "symbol": range_match.group("symbol"),
+            })
+            continue
+        bytes_match = _RE_CHKIMG_BYTES.search(stripped)
+        if bytes_match and mismatches:
+            mismatches[-1]["expected"] = bytes_match.group("expected").split()
+            mismatches[-1]["actual"] = bytes_match.group("actual").split()
+            continue
+        summary_match = _RE_CHKIMG_SUMMARY.search(stripped)
+        if summary_match:
+            summary = {
+                "error_count": int(summary_match.group("count")),
+                "scope": summary_match.group("scope").strip(),
+            }
+            continue
+        if re.search(r"\bno (?:image )?errors?\b", stripped, re.IGNORECASE):
+            summary = {"error_count": 0}
+            continue
+        unparsed_lines.append(stripped)
+
+    data = {
+        "verified": summary.get("error_count") == 0,
+        "summary": summary,
+        "mismatches": mismatches,
+    } if summary or mismatches else {}
+    return _parse_result(
+        raw,
+        data,
+        unparsed_lines,
+        recognized=bool(data),
+    )
+
+
+_RE_FUNCTION_ENTRY = re.compile(
+    r"Debugger function entry\s+(?P<address>[0-9a-f`]+)",
+    re.IGNORECASE,
+)
+_RE_FUNCTION_FIELD = re.compile(
+    r"^\s*(?P<key>[A-Za-z][A-Za-z0-9 ]+)\s*=\s*(?P<value>\S+).*$"
+)
+
+
+def parse_function_info(raw: str) -> ParseResult:
+    if not raw or not raw.strip():
+        return _failed(raw)
+
+    function: dict[str, Any] = {}
+    unparsed_lines: list[str] = []
+    for raw_line in raw.splitlines():
+        line = _clean_line(raw_line)
+        stripped = line.strip()
+        if not stripped:
+            continue
+        entry = _RE_FUNCTION_ENTRY.search(stripped)
+        if entry:
+            function["entry"] = _canonical_hex(entry.group("address"))
+            continue
+        field = _RE_FUNCTION_FIELD.match(stripped)
+        if field:
+            value = field.group("value")
+            if re.fullmatch(r"(?:0x)?[0-9a-f`]+", value, re.IGNORECASE):
+                value = _canonical_hex(value)
+            function[_field_name(field.group("key"))] = value
+            continue
+        if stripped.lower() == "exact matches:":
+            continue
+        unparsed_lines.append(stripped)
+    return _parse_result(
+        raw,
+        {"function": function} if function else {},
+        unparsed_lines,
+        recognized=bool(function),
     )

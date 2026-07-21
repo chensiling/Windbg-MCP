@@ -7,7 +7,7 @@ from ._evidence import run_command, run_mutation, run_read
 from ._models import ToolEnvelope
 from ._parser import parse_analyze, parse_registers, parse_stack_kp
 from ._response import error_item, make_response, next_action
-from .context_tool import _session_kind, _target_mode
+from .context_tool import _target_info
 
 
 AnalyzeScope = Literal["crash", "hang", "quick"]
@@ -15,7 +15,10 @@ AnalyzeScope = Literal["crash", "hang", "quick"]
 
 def register_analyze_tool(mcp):
     @mcp.tool(annotations=MIXED_STATE_TOOL, structured_output=True)
-    def windbg_analyze(scope: AnalyzeScope = "crash") -> ToolEnvelope:
+    def windbg_analyze(
+        scope: AnalyzeScope = "crash",
+        include_raw: bool = False,
+    ) -> ToolEnvelope:
         """Collect crash or hang observations without collapsing command evidence."""
 
         normalized_scope = scope.lower().strip()
@@ -29,7 +32,11 @@ def register_analyze_tool(mcp):
             "!analyze -v -hang" if normalized_scope == "hang" else "!analyze -v"
         )
         if normalized_scope != "crash":
-            analysis = run_read(analyze_command, parse_analyze)
+            analysis = run_read(
+                analyze_command,
+                parse_analyze,
+                include_raw=include_raw,
+            )
             data: dict[str, object] = {"scope": normalized_scope}
             if analysis.parsed is not None:
                 data.update(dict(analysis.parsed.data))
@@ -44,22 +51,25 @@ def register_analyze_tool(mcp):
                 )],
             )
 
-        target = run_read("vertarget")
-        debug_systems = run_read("||")
-        target_mode = _target_mode(
+        target = run_read("vertarget", include_raw=include_raw)
+        debug_systems = run_read("||", include_raw=include_raw)
+        target_info = _target_info(
             target.execution.output,
             debug_systems.execution.output,
         )
-        session_kind = _session_kind(
-            target.execution.output,
-            debug_systems.execution.output,
+        target_mode = str(target_info["target_mode"])
+        session_kind = str(target_info["session_kind"])
+        analysis = run_read(
+            analyze_command,
+            parse_analyze,
+            include_raw=include_raw,
         )
-        analysis = run_read(analyze_command, parse_analyze)
         sources = [target.source, debug_systems.source, analysis.source]
         data = {
             "scope": "crash",
             "target_mode": target_mode,
             "session_kind": session_kind,
+            "capabilities": target_info["capabilities"],
             "context_kind": "current_context",
         }
         errors = []
@@ -67,8 +77,12 @@ def register_analyze_tool(mcp):
             data.update(dict(analysis.parsed.data))
 
         dependent_context = False
-        if target_mode == "user" and session_kind == "dump":
-            exception_context = run_mutation(".ecxr", parse_registers)
+        if target_mode == "user" and session_kind == "user_dump":
+            exception_context = run_mutation(
+                ".ecxr",
+                parse_registers,
+                include_raw=include_raw,
+            )
             sources.append(exception_context.source)
             exception_registers = (
                 exception_context.parsed.data.get("registers")
@@ -95,16 +109,26 @@ def register_analyze_tool(mcp):
                 parse_registers,
                 read_only=True,
                 retryable=False,
+                include_raw=include_raw,
             )
             backtrace = run_command(
                 "kP 0n30",
                 parse_stack_kp,
                 read_only=True,
                 retryable=False,
+                include_raw=include_raw,
             )
         else:
-            registers = run_read("r", parse_registers)
-            backtrace = run_read("kP 0n30", parse_stack_kp)
+            registers = run_read(
+                "r",
+                parse_registers,
+                include_raw=include_raw,
+            )
+            backtrace = run_read(
+                "kP 0n30",
+                parse_stack_kp,
+                include_raw=include_raw,
+            )
         sources.extend([registers.source, backtrace.source])
 
         if registers.parsed is not None:

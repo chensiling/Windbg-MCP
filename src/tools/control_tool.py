@@ -13,11 +13,13 @@ ControlAction = Literal[
 ]
 
 
-def _target_state(status: str) -> str:
-    if status == "completed":
+def _target_state(execution) -> str:
+    if execution.status == "completed":
         return "broken"
-    if status == "timeout":
+    if execution.status == "timeout" and execution.session_state == "draining":
         return "running"
+    if execution.status in ("cancelled", "timeout") and execution.complete:
+        return "broken"
     return "indeterminate"
 
 
@@ -75,9 +77,12 @@ def register_control_tool(mcp):
         sources = []
         final_status = "indeterminate"
         for command in commands:
-            evidence = run_mutation(command)
+            evidence = run_mutation(
+                command,
+                cancel_on_timeout=normalized != "go",
+            )
             sources.append(evidence.source)
-            final_status = _target_state(evidence.execution.status)
+            final_status = _target_state(evidence.execution)
             if evidence.execution.status != "completed":
                 break
 

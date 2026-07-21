@@ -5,7 +5,7 @@ import re
 from typing import Callable
 
 from ._models import ToolSource
-from ._parser import ParseResult, parse_evaluate
+from ._parser import ParseResult, parse_evaluate, parse_target_info
 from ._registry import _exec_result
 from ._response import source_item
 
@@ -35,11 +35,16 @@ def run_command(
     *,
     read_only: bool,
     retryable: bool,
+    include_raw: bool = False,
+    timeout: float | None = None,
+    cancel_on_timeout: bool = True,
 ) -> CommandEvidence:
     execution = _exec_result(
         command,
         read_only=read_only,
         retryable=retryable,
+        timeout=timeout,
+        cancel_on_timeout=cancel_on_timeout,
     )
     parsed = None
     if parser is not None and (execution.output.strip() or execution.complete):
@@ -48,29 +53,75 @@ def run_command(
         command=command,
         execution=execution,
         parsed=parsed,
-        source=source_item(command, execution, parsed),
+        source=source_item(
+            command,
+            execution,
+            parsed,
+            include_raw=include_raw,
+        ),
     )
 
 
-def run_read(command: str, parser: Parser | None = None) -> CommandEvidence:
+def run_read(
+    command: str,
+    parser: Parser | None = None,
+    *,
+    include_raw: bool = False,
+    timeout: float | None = None,
+    cancel_on_timeout: bool = True,
+) -> CommandEvidence:
     return run_command(
         command,
         parser,
         read_only=True,
         retryable=True,
+        include_raw=include_raw,
+        timeout=timeout,
+        cancel_on_timeout=cancel_on_timeout,
     )
 
 
-def run_mutation(command: str, parser: Parser | None = None) -> CommandEvidence:
+def run_mutation(
+    command: str,
+    parser: Parser | None = None,
+    *,
+    include_raw: bool = False,
+    timeout: float | None = None,
+    cancel_on_timeout: bool = True,
+) -> CommandEvidence:
     return run_command(
         command,
         parser,
         read_only=False,
         retryable=False,
+        include_raw=include_raw,
+        timeout=timeout,
+        cancel_on_timeout=cancel_on_timeout,
     )
 
 
-def resolve_expression(expression: str) -> tuple[CommandEvidence, str | None]:
+def probe_target_info(
+    *,
+    include_raw: bool = False,
+) -> tuple[CommandEvidence, dict[str, object]]:
+    evidence = run_read("||", parse_target_info, include_raw=include_raw)
+    data = (
+        dict(evidence.parsed.data)
+        if evidence.parsed is not None and evidence.parsed.status != "failed"
+        else {
+            "target_mode": "unknown",
+            "session_kind": "unknown",
+            "capabilities": {},
+        }
+    )
+    return evidence, data
+
+
+def resolve_expression(
+    expression: str,
+    *,
+    include_raw: bool = False,
+) -> tuple[CommandEvidence, str | None]:
     normalized = expression.strip()
     cleaned = normalized.replace("`", "")
     if re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", cleaned):
@@ -80,7 +131,11 @@ def resolve_expression(expression: str) -> tuple[CommandEvidence, str | None]:
             lambda match: f"0x{match.group('value')}",
             normalized,
         )
-    evidence = run_read(f"? {normalized}", parse_evaluate)
+    evidence = run_read(
+        f"? {normalized}",
+        parse_evaluate,
+        include_raw=include_raw,
+    )
     resolved = None
     if (
         evidence.execution.status == "completed"

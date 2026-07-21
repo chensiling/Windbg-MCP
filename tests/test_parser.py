@@ -26,6 +26,14 @@ from tools._parser import (
     parse_thread_list_user,
     parse_thread_list_kernel,
     parse_breakpoints,
+    parse_target_info,
+    parse_thread_info,
+    parse_module_info,
+    parse_pte,
+    parse_pool,
+    parse_blackbox,
+    parse_image_verify,
+    parse_function_info,
 )
 from tools import breakpoint_tool
 from tools import _registry
@@ -91,6 +99,14 @@ SAMPLE_DISASM_PROMPT = """0: kd> nt!DbgBreakPointWithStatus:
 fffff805`990f90d0 cc              int     3
 fffff805`990f90d1 c3              ret"""
 
+SAMPLE_DISASM_LONG_BYTES = (
+    "fffff805`99123456 f7451840000000 "
+    "test dword ptr [rbp+18h],40000000h"
+)
+
+SAMPLE_DISASM_PARTIAL_MEMORY = """fffff805`99123456 cc int 3
+Memory access error at 'fffff805`99123457'"""
+
 SAMPLE_MEM_DD = """00007ff9`850bd78d  4800ebcc c338c483 cccccccc 48cccccc"""
 
 SAMPLE_MEM_DQ = """0000008e`77e7f0f0  00007ff9`8513a090 00007ff9`85097191
@@ -113,8 +129,45 @@ SAMPLE_MEM_DB_NO_DASH = """00000000`0012f000  41 42 43 44 45 46 47 48  ABCDEFGH"
 SAMPLE_MEM_ASCII = '''00000000`0012f000  "Hello, w"
 00000000`0012f008  "orld!"'''
 
+SAMPLE_MEM_UNAVAILABLE = (
+    "2: kd> 00000000`00000001  ?? ?? ?? ??"
+    "                                      ????"
+)
+
 SAMPLE_MODULES = """start             end                 module name
 00007ff9`84fa0000 00007ff9`85206000   ntdll      (pdb symbols)          C:\\ProgramData\\dbg\\sym\\ntdll.pdb\\23ADECD9479F123BF50906CE9B88193F1\\ntdll.pdb"""
+
+SAMPLE_THREAD_INFO = """THREAD ffffda02`73eea040  Cid 0004.00d8  WAIT:
+Owning Process            ffffda02`70004080       Image:         System
+Priority 12  BasePriority 8
+Child-SP          RetAddr               Call Site
+ffff968b`f8207708 fffff805`2d9c18d0     nt!KeWaitForSingleObject"""
+
+SAMPLE_MODULE_INFO = """start             end                 module name
+fffff805`99000000 fffff805`9a200000   nt         (pdb symbols)
+    Loaded symbol image file: ntkrnlmp.exe
+    Image path: ntkrnlmp.exe
+    Timestamp: 12345678"""
+
+SAMPLE_PTE = """VA ffffda02`73eea040
+PXE at FFFFF6FB`7DBEDDA0  PPE at FFFFF6FB`7DBB4050  PDE at FFFFF6FB`76809CF8  PTE at FFFFF6ED`0139F750
+contains 0A000000`01234863  contains 0A000000`01235863  contains 0A000000`01236863  contains 80000000`12345963
+pfn 12345 ---DA--KWEV"""
+
+SAMPLE_POOL = """Pool page ffffda02`73eea000 region is Nonpaged pool
+*ffffda02`73eea020 size: 40 previous size: 0 (Allocated) *Thre"""
+
+SAMPLE_BLACKBOX = """PnpActivityId : {01234567-89ab-cdef-0123-456789abcdef}
+PnpProblemCode : 24"""
+
+SAMPLE_IMAGE_VERIFY = """fffff805`99100000-fffff805`99100004  5 bytes - nt!Example
+    [ 0f 1f 44 00 00:cc cc cc cc cc ]
+1 errors : nt!Example (fffff805`99100000-fffff805`99100004)"""
+
+SAMPLE_FUNCTION_INFO = """Debugger function entry fffff805`99100000
+BeginAddress = fffff805`99100000
+EndAddress = fffff805`99100040
+UnwindInfoAddress = fffff805`99200000"""
 
 SAMPLE_MODULES_WITH_UNLOADED = """1: kd> start             end                 module name
 fffff807`7de00000 fffff807`7f250000   nt         (pdb symbols)          C:\\ProgramData\\Dbg\\sym\\ntkrnlmp.pdb
@@ -406,6 +459,28 @@ class TestParseMemoryDump:
             "ascii": "o",
         }
 
+    def test_question_mark_placeholders_are_unavailable_memory(self):
+        result = parse_memory_dump(SAMPLE_MEM_UNAVAILABLE)
+
+        assert result.status == "partial"
+        assert result.data["data"] == []
+        assert result.data["available"] is False
+        assert result.data["complete_range"] is False
+        assert "memory_access_error" in result.warnings
+
+    def test_values_before_question_mark_placeholders_are_preserved(self):
+        result = parse_memory_dump(
+            "00007ff9`850bd78d  cc eb ?? ??              ...."
+        )
+
+        assert result.status == "partial"
+        assert [entry["value"] for entry in result.data["data"]] == [
+            "cc",
+            "eb",
+        ]
+        assert result.data["complete_range"] is False
+        assert "memory_access_error" in result.warnings
+
 
 class TestParseModules:
     def test_parse(self):
@@ -429,6 +504,16 @@ class TestParseModules:
         assert result.raw == SAMPLE_MODULES_WITH_UNLOADED
 
 
+class TestParseModuleInfo:
+    def test_valid_empty_module_detail_is_not_a_parse_failure(self):
+        result = parse_module_info(
+            "Browse full module list\nstart             end                 module name"
+        )
+
+        assert result.status == "complete"
+        assert result.data == {"found": False, "module": {}}
+
+
 class TestParseSymbolList:
     def test_parse(self):
         result = parse_symbol_list(SAMPLE_SYMBOLS)
@@ -438,7 +523,16 @@ class TestParseSymbolList:
 
     def test_empty(self):
         result = parse_symbol_list("")
-        assert result["raw"] == ""
+        assert result.status == "complete"
+        assert result.data == {"found": False, "symbols": []}
+
+    def test_could_not_resolve_is_a_valid_empty_result(self):
+        result = parse_symbol_list(
+            "2: kd> ^ Couldn't resolve 'x DefinitelyMissingModule'"
+        )
+
+        assert result.status == "complete"
+        assert result.data == {"found": False, "symbols": []}
 
 
 class TestParseNearestSymbol:
@@ -484,6 +578,86 @@ class TestParseNearestSymbol:
             "ntdll!Second",
         ]
         assert result.unparsed_lines == ("trailing",)
+
+    def test_completed_prompt_without_match_is_not_found(self):
+        result = parse_nearest_symbol("0: kd> ln 1234\n0: kd>")
+
+        assert result.status == "complete"
+        assert result.data == {"found": False, "symbols": []}
+
+
+class TestParserRegressions:
+    def test_disassembly_accepts_long_machine_code_without_fixed_columns(self):
+        result = parse_disassembly(SAMPLE_DISASM_LONG_BYTES)
+
+        assert result.status == "complete"
+        assert result.data["instructions"][0]["bytes"] == "f7451840000000"
+        assert result.data["instructions"][0]["instruction"] == (
+            "test dword ptr [rbp+18h],40000000h"
+        )
+
+    def test_disassembly_retains_instructions_before_missing_page(self):
+        result = parse_disassembly(SAMPLE_DISASM_PARTIAL_MEMORY)
+
+        assert result.status == "partial"
+        assert len(result.data["instructions"]) == 1
+        assert result.data["complete_range"] is False
+        assert "memory_access_error" in result.warnings
+
+    def test_memory_dump_classifies_missing_page_after_valid_data(self):
+        raw = SAMPLE_MEM_DB_NO_DASH + "\nMemory access error at '0x0012f008'"
+        result = parse_memory_dump(raw)
+
+        assert result.status == "partial"
+        assert len(result.data["data"]) == 8
+        assert result.data["complete_range"] is False
+        assert "memory_access_error" in result.warnings
+
+
+class TestParseTargetInfo:
+    @pytest.mark.parametrize(
+        ("raw", "mode", "kind"),
+        [
+            (". 0 Live user mode: <Local>", "user", "live_user"),
+            (". 0 Live kernel mode: NET:port=50000", "kernel", "live_kernel"),
+            (". 0 64-bit User mini dump: a.dmp", "user", "user_dump"),
+            (
+                ". 0 64-bit Kernel triage dump: a.dmp",
+                "kernel",
+                "kernel_triage_dump",
+            ),
+            (
+                ". 0 64-bit Kernel bitmap dump: a.dmp",
+                "kernel",
+                "kernel_memory_dump",
+            ),
+            (
+                ". 0 64-bit Complete memory dump: a.dmp",
+                "kernel",
+                "complete_memory_dump",
+            ),
+        ],
+    )
+    def test_classifies_session_and_capabilities(self, raw, mode, kind):
+        result = parse_target_info(raw)
+
+        assert result.status == "complete"
+        assert result.data["target_mode"] == mode
+        assert result.data["session_kind"] == kind
+        assert result.data["capabilities"]["is_dump"] is kind.endswith("_dump")
+
+    def test_unknown_session_does_not_invent_negative_capabilities(self):
+        result = parse_target_info(
+            "Windows 11 Kernel Version 26100\nKernel base = fffff805`99000000"
+        )
+
+        assert result.status == "partial"
+        assert result.data["target_mode"] == "kernel"
+        assert result.data["session_kind"] == "unknown"
+        assert all(
+            value is None for value in result.data["capabilities"].values()
+        )
+        assert "session_kind_unknown" in result.warnings
 
 
 class TestParseTypeInfo:
@@ -629,6 +803,8 @@ ALL_PARSERS = [
     parse_symbol_list, parse_nearest_symbol, parse_type_info,
     parse_evaluate, parse_analyze, parse_process_list,
     parse_thread_list_user, parse_thread_list_kernel, parse_breakpoints,
+    parse_thread_info, parse_module_info, parse_pte, parse_pool,
+    parse_blackbox, parse_image_verify, parse_function_info,
 ]
 
 COMPLETE_CASES = [
@@ -648,6 +824,13 @@ COMPLETE_CASES = [
     (parse_thread_list_user, SAMPLE_THREADS_USER),
     (parse_thread_list_kernel, SAMPLE_RUNNING_TI),
     (parse_breakpoints, SAMPLE_BREAKPOINTS),
+    (parse_thread_info, SAMPLE_THREAD_INFO),
+    (parse_module_info, SAMPLE_MODULE_INFO),
+    (parse_pte, SAMPLE_PTE),
+    (parse_pool, SAMPLE_POOL),
+    (parse_blackbox, SAMPLE_BLACKBOX),
+    (parse_image_verify, SAMPLE_IMAGE_VERIFY),
+    (parse_function_info, SAMPLE_FUNCTION_INFO),
 ]
 
 
@@ -796,8 +979,15 @@ class TestTypedConsumers:
         source = source_item("bl", execution, result)
         payload = parsed_response("windbg_breakpoint", source, result)
         assert payload.data == dict(result.data)
-        assert payload.raw == raw
-        assert payload.errors[0].code == f"parse_{expected_status}"
+        assert payload.raw == ""
+        assert payload.sources[0].raw_size == len(raw)
+        assert payload.sources[0].command_id
+        if expected_status == "partial":
+            assert payload.errors == []
+            assert payload.warnings[0].code == "parse_partial"
+            assert payload.ok is True
+        else:
+            assert payload.errors[0].code == f"parse_{expected_status}"
 
 
 class TestParseCompleteness:
@@ -825,7 +1015,15 @@ class TestFailback:
     """Failed parsers retain raw output and never raise on malformed text."""
 
     def test_all_return_raw_on_empty(self):
-        for parser in (parser for parser in ALL_PARSERS if parser is not parse_breakpoints):
+        valid_empty_parsers = {
+            parse_breakpoints,
+            parse_symbol_list,
+            parse_nearest_symbol,
+        }
+        for parser in (
+            parser for parser in ALL_PARSERS
+            if parser not in valid_empty_parsers
+        ):
             result = parser("")
             assert result.status == "failed", parser.__name__
             assert result.data == {}

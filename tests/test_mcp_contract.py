@@ -25,18 +25,30 @@ BUSINESS_TOOLS = {
     "windbg_analyze",
     "windbg_evaluate",
     "windbg_sympath",
+    "windbg_session",
+    "windbg_output",
+    "windbg_thread",
+    "windbg_module",
+    "windbg_memory_mapping",
+    "windbg_pool",
+    "windbg_blackbox",
+    "windbg_image_verify",
 }
 
 ENVELOPE_FIELDS = {
     "ok",
+    "schema_version",
     "tool",
     "execution_status",
+    "core_result_status",
     "parse_status",
     "verification_status",
     "data",
     "inferences",
     "sources",
     "errors",
+    "warnings",
+    "limitations",
     "next_actions",
     "raw",
 }
@@ -54,6 +66,14 @@ EXPECTED_ANNOTATIONS = {
     "windbg_evaluate": (True, False, True, False),
     "windbg_sympath": (False, True, False, True),
     "windbg_exec": (False, True, False, True),
+    "windbg_session": (False, True, False, True),
+    "windbg_output": (True, False, True, False),
+    "windbg_thread": (True, False, True, False),
+    "windbg_module": (True, False, True, False),
+    "windbg_memory_mapping": (True, False, True, False),
+    "windbg_pool": (True, False, True, False),
+    "windbg_blackbox": (True, False, True, False),
+    "windbg_image_verify": (True, False, True, False),
 }
 
 
@@ -196,6 +216,7 @@ async def test_runtime_calls_return_direct_envelope_and_explicit_raw_content(
     assert structured["tool"] == "windbg_evaluate"
     assert structured["ok"] is True
     assert structured["execution_status"] == "completed"
+    assert structured["core_result_status"] == "usable"
     assert structured["parse_status"] == "complete"
     assert structured["verification_status"] == "not_required"
     assert structured["data"] == {
@@ -206,11 +227,18 @@ async def test_runtime_calls_return_direct_envelope_and_explicit_raw_content(
     assert len(structured["sources"]) == 1
     source = structured["sources"][0]
     assert source["command"] == "? @rip"
+    assert source["command_id"]
     assert source["execution_status"] == "completed"
     assert source["parse_status"] == "complete"
     assert source["complete"] is True
+    assert source["raw"] == ""
+    assert source["raw_size"] > 0
+    assert source["raw_included"] is False
     assert source["warnings"] == []
-    assert json.loads(business_result.content[0].text) == structured
+    summary = json.loads(business_result.content[0].text)
+    assert summary["tool"] == "windbg_evaluate"
+    assert summary["structured_content"] is True
+    assert summary != structured
 
     assert raw_result.structuredContent is None
     assert len(raw_result.content) == 1

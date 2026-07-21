@@ -16,6 +16,7 @@ from tools._response import (
     parse_int_arg,
     source_item,
     validate_intent_text,
+    validate_module_name,
 )
 
 
@@ -49,8 +50,26 @@ class TestResponseEnvelope:
         assert result.parse_status == "complete"
         assert result.verification_status == "not_required"
         assert result.data["registers"]["rip"] == "0x1"
-        assert result.sources[0].raw == "r"
-        assert result.raw == "r"
+        assert result.schema_version == "2.0"
+        assert result.core_result_status == "usable"
+        assert result.sources[0].raw == ""
+        assert result.sources[0].raw_size == 1
+        assert result.sources[0].raw_included is False
+        assert result.sources[0].command_id
+        assert result.raw == ""
+
+    def test_source_can_explicitly_include_raw_output(self):
+        parsed = ParseResult("complete", {"value": "0x1"}, "raw", [], [])
+        source = source_item(
+            "? 1",
+            _completed("raw"),
+            parsed,
+            include_raw=True,
+        )
+
+        assert source.raw == "raw"
+        assert source.raw_included is True
+        assert source.raw_size == 3
 
     def test_source_item_bounds_async_output_but_preserves_engine_evidence(self):
         async_output = "HEAD:" + ("x" * 2_500) + ":TAIL"
@@ -107,7 +126,7 @@ class TestResponseEnvelope:
 
     @pytest.mark.parametrize(
         ("parse_status", "expected_ok"),
-        [("complete", True), ("partial", False), ("failed", False)],
+        [("complete", True), ("partial", True), ("failed", False)],
     )
     def test_maps_every_parse_status(self, parse_status, expected_ok):
         if parse_status == "complete":
@@ -136,7 +155,11 @@ class TestResponseEnvelope:
         assert result.ok is expected_ok
         assert result.data == dict(parsed.data)
         assert result.sources[0].unparsed_lines == list(parsed.unparsed_lines)
-        if not expected_ok:
+        if parse_status == "partial":
+            assert result.errors == []
+            assert result.warnings[0].code == "parse_partial"
+            assert result.core_result_status == "usable"
+        elif not expected_ok:
             assert result.errors[0].stage == "parsing"
 
     def test_aggregate_preserves_each_source_and_has_no_ambiguous_raw(self):
@@ -146,7 +169,9 @@ class TestResponseEnvelope:
         result = make_response("windbg_analyze", [first, second], {"scope": "crash"})
 
         assert [source.command for source in result.sources] == ["r", "kP 0n30"]
-        assert [source.raw for source in result.sources] == ["register raw", "stack raw"]
+        assert [source.raw for source in result.sources] == ["", ""]
+        assert [source.raw_size for source in result.sources] == [12, 9]
+        assert all(source.command_id for source in result.sources)
         assert result.raw == ""
 
     def test_execution_and_verification_status_are_independent(self):
@@ -164,6 +189,7 @@ class TestResponseEnvelope:
         )
 
         assert result.execution_status == "timeout"
+        assert result.core_result_status == "unavailable"
         assert result.parse_status == "not_run"
         assert result.verification_status == "verified"
         assert result.ok is False
@@ -179,6 +205,7 @@ class TestResponseEnvelope:
         assert isinstance(result.errors[0], ToolError)
         assert result.errors[0].stage == "input"
         assert result.execution_status == "not_run"
+        assert result.core_result_status == "unavailable"
         assert result.ok is False
 
     def test_error_item_shape(self):
@@ -203,6 +230,17 @@ class TestInputHelpers:
         assert error is not None
         assert error.code == "unsafe_argument"
         assert error.recoverable is False
+
+    @pytest.mark.parametrize("value", ["-f nt", "nt other", "nt!KeBugCheck"])
+    def test_module_name_rejects_flags_extra_arguments_and_symbols(self, value):
+        error = validate_module_name(value)
+
+        assert error is not None
+        assert error.code == "invalid_argument"
+
+    @pytest.mark.parametrize("value", ["nt", "my-driver.sys", "win32kbase"])
+    def test_module_name_accepts_one_bounded_module_token(self, value):
+        assert validate_module_name(value) is None
 
     def test_decimal(self):
         value, error = parse_int_arg("16", "count", min_value=1, max_value=32)

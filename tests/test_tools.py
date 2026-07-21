@@ -5,7 +5,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from debugger.engine import ExecutionResult
+from debugger.engine import ExecutionResult, SessionSnapshot
 from tools import _registry
 from tools._models import ToolEnvelope
 from tools.analyze_tool import register_analyze_tool
@@ -19,6 +19,14 @@ from tools.lookup_tool import register_lookup_tool
 from tools.memory_tool import register_memory_tool
 from tools.stack_tool import register_stack_tool
 from tools.sympath_tool import register_sympath_tool
+from tools.session_tool import register_session_tool
+from tools.output_tool import register_output_tool
+from tools.thread_tool import register_thread_tool
+from tools.module_tool import register_module_tool
+from tools.mapping_tool import register_mapping_tool
+from tools.pool_tool import register_pool_tool
+from tools.blackbox_tool import register_blackbox_tool
+from tools.image_verify_tool import register_image_verify_tool
 
 
 EVALUATE_RIP = "Evaluate expression: 140709204350861 = 00007ff9`850bd78d"
@@ -54,6 +62,7 @@ SYSTEM_USER_LIVE = ".  0 Live user mode: <Local>"
 SYSTEM_USER_DUMP = ".  0 64-bit User mini dump: C:\\dumps\\notepad.dmp"
 SYSTEM_KERNEL_LIVE = ".  0 Live kernel mode: NET:port=50000"
 SYSTEM_KERNEL_DUMP = ".  0 64-bit Kernel bitmap dump: C:\\dumps\\memory.dmp"
+SYSTEM_KERNEL_TRIAGE = ".  0 64-bit Kernel triage dump: C:\\dumps\\triage.dmp"
 SYSTEM_KERNEL_REMOTE = (
     "1: kd> .  0 Remote KD: KdSrv:Server=@{<Local>},"
     "Trans=@{NET:Port=50000,Key=1.2.3.4,Target}"
@@ -66,6 +75,21 @@ BREAKPOINT = (
     " 0 e Disable Clear  00007ff9`850bd78d     "
     "0001 (0001)  0:**** ntdll!LdrpDoDebuggerBreak @rcx == 0"
 )
+THREAD_INFO = """THREAD ffffda02`73eea040  Cid 0004.00d8  WAIT:
+Owning Process            ffffda02`70004080       Image:         System
+Priority 12  BasePriority 8"""
+MODULE_INFO = """start             end                 module name
+fffff805`99000000 fffff805`9a200000   nt         (pdb symbols)
+    Image path: ntkrnlmp.exe"""
+PTE_INFO = """VA 00007ff9`850bd78d
+PXE at FFFFF6FB`7DBEDDA0  PPE at FFFFF6FB`7DBB4050
+contains 0A000000`01234863  contains 0A000000`01235863"""
+POOL_INFO = """Pool page 00007ff9`850bd000 region is Nonpaged pool
+*00007ff9`850bd020 size: 40 previous size: 0 (Allocated) *Test"""
+BLACKBOX_INFO = "PnpProblemCode : 24"
+IMAGE_VERIFY = """fffff805`99100000-fffff805`99100004  5 bytes - nt!Example
+    [ 0f 1f 44 00 00:cc cc cc cc cc ]
+1 errors : nt!Example (fffff805`99100000-fffff805`99100004)"""
 
 
 def completed(output=""):
@@ -88,11 +112,21 @@ class ScriptedExecutor:
         self.steps = list(steps)
         self.calls = []
 
-    def execute(self, command, *, read_only=False, retryable=False):
+    def execute(
+        self,
+        command,
+        *,
+        read_only=False,
+        retryable=False,
+        timeout=None,
+        cancel_on_timeout=True,
+    ):
         self.calls.append({
             "command": command,
             "read_only": read_only,
             "retryable": retryable,
+            "timeout": timeout,
+            "cancel_on_timeout": cancel_on_timeout,
         })
         if not self.steps:
             raise AssertionError(f"unexpected command: {command}")
@@ -119,6 +153,14 @@ def toolset():
         register_analyze_tool,
         register_eval_tool,
         register_sympath_tool,
+        register_session_tool,
+        register_output_tool,
+        register_thread_tool,
+        register_module_tool,
+        register_mapping_tool,
+        register_pool_tool,
+        register_blackbox_tool,
+        register_image_verify_tool,
     ):
         register(mcp)
     return mcp.tools
@@ -130,7 +172,7 @@ def install_executor(monkeypatch, *steps):
     return executor
 
 
-def test_registers_all_twelve_public_tools(toolset):
+def test_registers_complete_public_tool_surface(toolset):
     assert set(toolset) == {
         "windbg_exec",
         "windbg_context",
@@ -144,6 +186,14 @@ def test_registers_all_twelve_public_tools(toolset):
         "windbg_analyze",
         "windbg_evaluate",
         "windbg_sympath",
+        "windbg_session",
+        "windbg_output",
+        "windbg_thread",
+        "windbg_module",
+        "windbg_memory_mapping",
+        "windbg_pool",
+        "windbg_blackbox",
+        "windbg_image_verify",
     }
 
 
@@ -454,7 +504,11 @@ def test_step_out_count_runs_gu_once_per_frame(toolset, monkeypatch):
     ("execution", "expected_state", "expected_verification"),
     [
         (
-            ExecutionResult(status="timeout", error="target did not break"),
+            ExecutionResult(
+                status="timeout",
+                error="target did not break",
+                session_state="draining",
+            ),
             "running",
             "indeterminate",
         ),
@@ -483,6 +537,8 @@ def test_control_reports_non_completed_target_state(
     assert result.data["target_state"] == expected_state
     assert result.verification_status == expected_verification
     assert result.ok is False
+    if execution.status == "timeout":
+        assert _registry._executor.calls[0]["cancel_on_timeout"] is False
 
 
 def test_sympath_set_and_reload_state_are_verified(toolset, monkeypatch):
@@ -593,7 +649,7 @@ def test_symbol_reload_never_verifies_deferred_or_missing_module_state(
             VERTARGET_USER,
             SYSTEM_USER_LIVE,
             "user",
-            "live",
+            "live_user",
             "~",
             THREADS_USER,
             "user_threads",
@@ -602,7 +658,7 @@ def test_symbol_reload_never_verifies_deferred_or_missing_module_state(
             VERTARGET_USER,
             SYSTEM_USER_DUMP,
             "user",
-            "dump",
+            "user_dump",
             "~",
             THREADS_USER,
             "user_threads",
@@ -611,7 +667,7 @@ def test_symbol_reload_never_verifies_deferred_or_missing_module_state(
             VERTARGET_KERNEL,
             SYSTEM_KERNEL_LIVE,
             "kernel",
-            "live",
+            "live_kernel",
             "!running -ti",
             THREADS_KERNEL,
             "kernel_running",
@@ -620,7 +676,7 @@ def test_symbol_reload_never_verifies_deferred_or_missing_module_state(
             VERTARGET_KERNEL,
             SYSTEM_KERNEL_REMOTE,
             "kernel",
-            "live",
+            "live_kernel",
             "!running -ti",
             THREADS_KERNEL,
             "kernel_running",
@@ -629,7 +685,7 @@ def test_symbol_reload_never_verifies_deferred_or_missing_module_state(
             VERTARGET_KERNEL,
             SYSTEM_KERNEL_DUMP,
             "kernel",
-            "dump",
+            "kernel_memory_dump",
             "!running -ti",
             THREADS_KERNEL,
             "kernel_running",
@@ -654,7 +710,6 @@ def test_context_routes_real_user_kernel_and_live_dump_forms(
         ("r", completed(REGISTERS)),
         ("kP 0n1", completed(STACK)),
         (".lastevent", completed("Last event: breakpoint")),
-        ("lm", completed(MODULE_DEFERRED)),
         (thread_command, completed(thread_output)),
     )
 
@@ -664,19 +719,22 @@ def test_context_routes_real_user_kernel_and_live_dump_forms(
     assert result.data["target_mode"] == expected_mode
     assert result.data["session_kind"] == expected_session
     assert result.data["target_state"] == "broken"
-    assert len(result.sources) == 7
-    assert result.inferences[0].name == "symbol_health"
-    assert result.inferences[1].value == expected_route
+    assert len(result.sources) == 6
+    assert result.data["modules_included"] is False
+    assert result.inferences[0].value == expected_route
     assert executor.calls[-1]["command"] == thread_command
     executor.assert_done()
 
 
 def test_session_kind_recognizes_remote_kd_target_as_live():
-    assert _session_kind(SYSTEM_KERNEL_REMOTE) == "live"
+    assert _session_kind(SYSTEM_KERNEL_REMOTE) == "live_kernel"
 
 
 def test_session_kind_keeps_dump_priority_over_remote_live_evidence():
-    assert _session_kind(SYSTEM_KERNEL_REMOTE, SYSTEM_KERNEL_DUMP) == "dump"
+    assert _session_kind(
+        SYSTEM_KERNEL_REMOTE,
+        SYSTEM_KERNEL_DUMP,
+    ) == "kernel_memory_dump"
 
 
 def test_crash_analysis_uses_exception_context_only_for_user_dump(toolset, monkeypatch):
@@ -693,7 +751,7 @@ def test_crash_analysis_uses_exception_context_only_for_user_dump(toolset, monke
     result = toolset["windbg_analyze"]("crash")
 
     assert result.data["target_mode"] == "user"
-    assert result.data["session_kind"] == "dump"
+    assert result.data["session_kind"] == "user_dump"
     assert result.data["context_kind"] == "exception_context"
     assert [source.command for source in result.sources] == [
         "vertarget", "||", "!analyze -v", ".ecxr", "r", "kP 0n30",
@@ -724,9 +782,14 @@ def test_crash_analysis_does_not_invent_exception_context(toolset, monkeypatch):
 @pytest.mark.parametrize(
     ("vertarget", "debug_systems", "expected_mode", "expected_session"),
     [
-        (VERTARGET_USER, SYSTEM_USER_LIVE, "user", "live"),
-        (VERTARGET_KERNEL, SYSTEM_KERNEL_LIVE, "kernel", "live"),
-        (VERTARGET_KERNEL, SYSTEM_KERNEL_DUMP, "kernel", "dump"),
+        (VERTARGET_USER, SYSTEM_USER_LIVE, "user", "live_user"),
+        (VERTARGET_KERNEL, SYSTEM_KERNEL_LIVE, "kernel", "live_kernel"),
+        (
+            VERTARGET_KERNEL,
+            SYSTEM_KERNEL_DUMP,
+            "kernel",
+            "kernel_memory_dump",
+        ),
     ],
 )
 def test_crash_analysis_does_not_select_ecxr_outside_user_dumps(
@@ -756,6 +819,299 @@ def test_crash_analysis_does_not_select_ecxr_outside_user_dumps(
         "vertarget", "||", "!analyze -v", "r", "kP 0n30",
     ]
     executor.assert_done()
+
+
+def test_partial_analyze_keeps_core_result_usable(toolset, monkeypatch):
+    install_executor(
+        monkeypatch,
+        ("!analyze -v", completed(ANALYZE + "\nAUXILIARY UNKNOWN LINE")),
+    )
+
+    result = toolset["windbg_analyze"]("quick")
+
+    assert result.ok is True
+    assert result.core_result_status == "usable"
+    assert result.parse_status == "partial"
+    assert result.errors == []
+    assert result.warnings[0].code == "parse_partial"
+
+
+def test_context_omits_modules_by_default_and_limits_explicit_modules(
+    toolset,
+    monkeypatch,
+):
+    modules = MODULE_DEFERRED + "\n00007ff9`86000000 00007ff9`86100000 other (deferred)"
+    executor = install_executor(
+        monkeypatch,
+        ("vertarget", completed(VERTARGET_USER)),
+        ("||", completed(SYSTEM_USER_LIVE)),
+        ("r", completed(REGISTERS)),
+        ("kP 0n1", completed(STACK)),
+        (".lastevent", completed("Last event: breakpoint")),
+        ("lm", completed(modules)),
+    )
+
+    result = toolset["windbg_context"](
+        include_modules=True,
+        module_limit="1",
+    )
+
+    assert result.ok is True
+    assert result.data["modules_included"] is True
+    assert result.data["module_count"] == 2
+    assert len(result.data["modules"]) == 1
+    assert result.data["modules_truncated"] is True
+    assert result.limitations[0].path == "data.modules"
+    assert all(source.raw == "" for source in result.sources)
+    assert [call["command"] for call in executor.calls][-1] == "lm"
+
+
+def test_raw_evidence_is_retrievable_by_command_id(toolset, monkeypatch):
+    install_executor(
+        monkeypatch,
+        ("? @rip", completed(EVALUATE_RIP)),
+    )
+    evaluated = toolset["windbg_evaluate"]("@rip")
+    command_id = evaluated.sources[0].command_id
+
+    page = toolset["windbg_output"](command_id, limit="8")
+
+    assert page.ok is True
+    assert page.data["output"] == EVALUATE_RIP[:8]
+    assert page.data["has_more"] is True
+    assert page.data["next_offset"] == 8
+
+
+def test_session_tool_uses_out_of_band_executor_controls(toolset, monkeypatch):
+    class SessionExecutor:
+        interrupted = []
+
+        def session_snapshot(self):
+            return SessionSnapshot(
+                state="executing",
+                connected=True,
+                active_command_id="cmd-1",
+                interrupt_supported=True,
+            )
+
+        def interrupt(self, command_id):
+            self.interrupted.append(command_id)
+            return True
+
+    executor = SessionExecutor()
+    monkeypatch.setattr(_registry, "_executor", executor)
+
+    result = toolset["windbg_session"]("interrupt", "cmd-1")
+
+    assert result.ok is True
+    assert executor.interrupted == ["cmd-1"]
+
+
+def test_kernel_diagnostic_tools_return_structured_observations(toolset, monkeypatch):
+    executor = install_executor(
+        monkeypatch,
+        ("||", completed(SYSTEM_KERNEL_LIVE)),
+        (
+            "? 0xffffda0273eea040",
+            completed(
+                "Evaluate expression: -41770906902464 = "
+                "ffffda02`73eea040"
+            ),
+        ),
+        ("!thread 0xffffda0273eea040 0x6", completed(THREAD_INFO)),
+        ("lmvm nt", completed(MODULE_INFO)),
+        ("||", completed(SYSTEM_KERNEL_LIVE)),
+        ("? @rip", completed(EVALUATE_RIP)),
+        ("!pte 0x00007ff9850bd78d", completed(PTE_INFO)),
+    )
+
+    thread = toolset["windbg_thread"]("ffffda02`73eea040")
+    module = toolset["windbg_module"]("nt")
+    mapping = toolset["windbg_memory_mapping"]("@rip")
+
+    assert thread.ok is True
+    assert thread.data["thread"]["process_image"] == "System"
+    assert module.ok is True
+    assert module.data["module"]["image_path"] == "ntkrnlmp.exe"
+    assert mapping.ok is True
+    assert len(mapping.data["entries"]) == 2
+    executor.assert_done()
+
+
+def test_image_verify_rejects_option_injection(toolset, monkeypatch):
+    executor = install_executor(monkeypatch)
+
+    result = toolset["windbg_image_verify"]("-f nt")
+
+    assert result.ok is False
+    assert result.errors[0].code == "invalid_argument"
+    executor.assert_done()
+
+
+def test_module_lookup_reports_valid_empty_result(toolset, monkeypatch):
+    executor = install_executor(
+        monkeypatch,
+        (
+            "lmvm missing",
+            completed(
+                "Browse full module list\n"
+                "start             end                 module name"
+            ),
+        ),
+    )
+
+    result = toolset["windbg_module"]("missing")
+
+    assert result.ok is True
+    assert result.core_result_status == "empty"
+    assert result.data["found"] is False
+    executor.assert_done()
+
+
+def test_symbol_resolution_failure_reports_valid_empty_result(toolset, monkeypatch):
+    executor = install_executor(
+        monkeypatch,
+        (
+            "x DefinitelyMissingModule!DefinitelyMissingSymbol",
+            completed(
+                "2: kd> ^ Couldn't resolve 'x DefinitelyMissingModule'"
+            ),
+        ),
+    )
+
+    result = toolset["windbg_lookup"](
+        "DefinitelyMissingModule!DefinitelyMissingSymbol",
+        "symbol",
+    )
+
+    assert result.ok is True
+    assert result.core_result_status == "empty"
+    assert result.parse_status == "complete"
+    assert result.data["found"] is False
+    assert result.data["symbols"] == []
+    executor.assert_done()
+
+
+def test_triage_pool_is_guarded_but_force_preserves_escape_path(toolset, monkeypatch):
+    guarded_executor = install_executor(
+        monkeypatch,
+        ("||", completed(SYSTEM_KERNEL_TRIAGE)),
+    )
+
+    guarded = toolset["windbg_pool"]("@rip")
+
+    assert guarded.ok is False
+    assert guarded.errors[0].code == "command_unsupported_for_dump_type"
+    guarded_executor.assert_done()
+
+    forced_executor = install_executor(
+        monkeypatch,
+        ("||", completed(SYSTEM_KERNEL_TRIAGE)),
+        ("? @rip", completed(EVALUATE_RIP)),
+        ("!pool 0x00007ff9850bd78d", completed(POOL_INFO)),
+    )
+
+    forced = toolset["windbg_pool"]("@rip", force=True)
+
+    assert forced.ok is True
+    assert forced.data["allocations"][0]["tag"] == "Test"
+    forced_executor.assert_done()
+
+
+def test_pool_does_not_treat_unknown_session_as_unsupported_dump(
+    toolset,
+    monkeypatch,
+):
+    executor = install_executor(
+        monkeypatch,
+        ("||", completed("Kernel base = fffff805`99000000")),
+    )
+
+    result = toolset["windbg_pool"]("@rip")
+
+    assert result.ok is False
+    assert result.data["session_kind"] == "unknown"
+    assert result.errors[0].code == "target_capability_unknown"
+    assert result.limitations[0].code == "target_capability_unknown"
+    executor.assert_done()
+
+
+def test_blackbox_and_image_verification_use_bounded_typed_paths(toolset, monkeypatch):
+    executor = install_executor(
+        monkeypatch,
+        ("||", completed(SYSTEM_KERNEL_DUMP)),
+        ("!blackboxpnp", completed(BLACKBOX_INFO)),
+        ("!chkimg -d nt", completed(IMAGE_VERIFY)),
+    )
+
+    blackbox = toolset["windbg_blackbox"]("pnp")
+    image = toolset["windbg_image_verify"]("nt")
+
+    assert blackbox.ok is True
+    assert blackbox.data["records"]["pnp"]["fields"]["pnp_problem_code"] == "24"
+    assert image.ok is True
+    assert image.data["verified"] is False
+    assert executor.calls[-1]["timeout"] == 120
+    executor.assert_done()
+
+
+def test_dump_memory_error_reports_limitation_without_losing_partial_data(
+    toolset,
+    monkeypatch,
+):
+    partial = "00007ff9`850bd78d  cc eb\nMemory access error at '00007ff9`850bd78f'"
+    install_executor(
+        monkeypatch,
+        ("? @rip", completed(EVALUATE_RIP)),
+        ("db 0x00007ff9850bd78d L0n2", completed(partial)),
+        ("||", completed(SYSTEM_KERNEL_TRIAGE)),
+    )
+
+    result = toolset["windbg_read_memory"]("@rip", size="2", format="byte")
+
+    assert result.ok is True
+    assert result.core_result_status == "usable"
+    assert result.parse_status == "partial"
+    assert len(result.data["data"]) == 2
+    assert result.data["range_complete"] is False
+    assert result.limitations[0].code == "dump_data_unavailable"
+
+
+def test_dump_memory_error_without_data_is_unavailable(toolset, monkeypatch):
+    install_executor(
+        monkeypatch,
+        ("? @rip", completed(EVALUATE_RIP)),
+        ("db 0x00007ff9850bd78d L0n2", completed("Memory access error")),
+        ("||", completed(SYSTEM_KERNEL_TRIAGE)),
+    )
+
+    result = toolset["windbg_read_memory"]("@rip", size="2", format="byte")
+
+    assert result.ok is False
+    assert result.core_result_status == "unavailable"
+    assert any(error.code == "dump_data_unavailable" for error in result.errors)
+
+
+def test_dump_unknown_memory_placeholders_are_unavailable(toolset, monkeypatch):
+    install_executor(
+        monkeypatch,
+        ("? @rip", completed(EVALUATE_RIP)),
+        (
+            "db 0x00007ff9850bd78d L0n2",
+            completed("00007ff9`850bd78d  ?? ??              ??"),
+        ),
+        ("||", completed(SYSTEM_KERNEL_TRIAGE)),
+    )
+
+    result = toolset["windbg_read_memory"]("@rip", size="2", format="byte")
+
+    assert result.ok is False
+    assert result.execution_status == "completed"
+    assert result.core_result_status == "unavailable"
+    assert result.parse_status == "partial"
+    assert result.data["range_complete"] is False
+    assert result.limitations[0].code == "dump_data_unavailable"
+    assert any(error.code == "dump_data_unavailable" for error in result.errors)
 
 
 @pytest.mark.parametrize(

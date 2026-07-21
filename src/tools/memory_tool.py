@@ -4,11 +4,12 @@ import re
 from typing import Literal
 
 from ._annotations import DESTRUCTIVE_TOOL, READ_ONLY_TOOL
-from ._evidence import resolve_expression, run_mutation, run_read
+from ._evidence import probe_target_info, resolve_expression, run_mutation, run_read
 from ._models import ToolEnvelope
 from ._parser import parse_memory_dump
 from ._response import (
     error_item,
+    limitation_item,
     make_response,
     parse_int_arg,
     validate_intent_text,
@@ -112,7 +113,48 @@ def register_memory_tool(mcp):
         sources.append(read.source)
         if read.parsed is not None:
             data.update(dict(read.parsed.data))
-        return make_response("windbg_read_memory", sources, data)
+        data["returned_size"] = len(data.get("data", []))
+        data["range_complete"] = (
+            data["returned_size"] == size_value
+            and data.get("complete_range", True)
+        )
+
+        errors = []
+        limitations = []
+        core_status = None
+        if (
+            read.parsed is not None
+            and "memory_access_error" in read.parsed.warnings
+        ):
+            target_evidence, target_info = probe_target_info()
+            sources.append(target_evidence.source)
+            session_kind = str(target_info["session_kind"])
+            data["target_mode"] = target_info["target_mode"]
+            data["session_kind"] = session_kind
+            data["capabilities"] = target_info["capabilities"]
+            is_dump = session_kind.endswith("_dump")
+            code = "dump_data_unavailable" if is_dump else "memory_access_error"
+            message = (
+                "The dump did not capture the requested memory range."
+                if is_dump
+                else "The target could not provide the requested memory range."
+            )
+            limitations.append(limitation_item(
+                code,
+                message,
+                path="data.data",
+            ))
+            if not data.get("data"):
+                errors.append(error_item(code, message, stage="target"))
+                core_status = "unavailable"
+        return make_response(
+            "windbg_read_memory",
+            sources,
+            data,
+            errors=errors,
+            limitations=limitations,
+            core_result_status=core_status,
+        )
 
     @mcp.tool(
         annotations=DESTRUCTIVE_TOOL,

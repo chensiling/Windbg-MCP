@@ -8,6 +8,7 @@ class Config:
     connect_host: str = "127.0.0.1"
     connect_port: int = 50000
     command_timeout: int = 30
+    interrupt_timeout: int = 3
     max_retries: int = 3
     debug_json: bool = False
 
@@ -18,6 +19,7 @@ class Config:
             connect_host=os.getenv("WINDBG_MCP_DEBUG_HOST", "127.0.0.1"),
             connect_port=int(os.getenv("WINDBG_MCP_DEBUG_PORT", "50000")),
             command_timeout=int(os.getenv("WINDBG_MCP_TIMEOUT", "30")),
+            interrupt_timeout=int(os.getenv("WINDBG_MCP_INTERRUPT_TIMEOUT", "3")),
             max_retries=int(os.getenv("WINDBG_MCP_RETRIES", "3")),
             debug_json=os.getenv("WINDBG_MCP_DEBUG_JSON", "").lower() in ("1", "true", "yes"),
         )

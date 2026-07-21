@@ -3,7 +3,12 @@ import logging
 import time
 from threading import Lock
 
-from .engine import DebugEngine, ExecutionContractError, ExecutionResult
+from .engine import (
+    DebugEngine,
+    ExecutionContractError,
+    ExecutionResult,
+    SessionSnapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,24 +35,40 @@ class CommandExecutor:
         *,
         read_only: bool = False,
         retryable: bool = False,
+        timeout: float | None = None,
+        cancel_on_timeout: bool = True,
     ) -> ExecutionResult:
+        effective_timeout = self._timeout if timeout is None else timeout
+        if effective_timeout <= 0:
+            raise ValueError("timeout must be greater than zero")
         with self._lock:
-            return self._execute_locked(command, read_only, retryable)
+            return self._execute_locked(
+                command,
+                read_only,
+                retryable,
+                effective_timeout,
+                cancel_on_timeout,
+            )
 
     def _execute_locked(
         self,
         command: str,
         read_only: bool,
         retryable: bool,
+        timeout: float,
+        cancel_on_timeout: bool,
     ) -> ExecutionResult:
         total_attempts = 0
         session_restarted = False
-        command_output: list[str] = []
         async_output: list[str] = []
 
         for attempt in range(1, self._max_retries + 1):
             try:
-                result = self._engine.execute(command, timeout=self._timeout)
+                result = self._engine.execute(
+                    command,
+                    timeout=timeout,
+                    cancel_on_timeout=cancel_on_timeout,
+                )
             except Exception as e:
                 raise ExecutionContractError(
                     "debugger engine raised instead of returning ExecutionResult"
@@ -64,15 +85,13 @@ class CommandExecutor:
                     "debugger engine returned an invalid ExecutionResult"
                 ) from e
 
-            total_attempts += result.attempts
-            if result.output:
-                command_output.append(result.output)
+            submitted_attempts = result.attempts
+            total_attempts += submitted_attempts
             if result.async_output:
                 async_output.append(result.async_output)
             session_restarted = session_restarted or result.session_restarted
             result = replace(
                 result,
-                output="".join(command_output),
                 attempts=total_attempts,
                 session_restarted=session_restarted,
                 async_output="".join(async_output),
@@ -81,7 +100,14 @@ class CommandExecutor:
             if result.status == "completed" and result.complete:
                 return result
 
-            may_replay = read_only and retryable
+            # A command that may have reached the debugger is never replayed.
+            # Automatic recovery is limited to a proven pre-submission disconnect.
+            may_replay = (
+                read_only
+                and retryable
+                and result.status == "disconnected"
+                and submitted_attempts == 0
+            )
             if not may_replay or attempt >= self._max_retries:
                 return result
 
@@ -95,6 +121,7 @@ class CommandExecutor:
                     attempts=total_attempts,
                     session_restarted=session_restarted,
                     async_output="".join(async_output),
+                    session_state="disconnected",
                 )
             session_restarted = True
 
@@ -105,6 +132,18 @@ class CommandExecutor:
             session_restarted=session_restarted,
             async_output="".join(async_output),
         )
+
+    def session_snapshot(self) -> SessionSnapshot:
+        return self._engine.session_snapshot()
+
+    def interrupt(self, command_id: str | None = None) -> bool:
+        return self._engine.interrupt(command_id)
+
+    def recover(self) -> str | None:
+        """Explicitly replace the debugger subprocess and reconnect its target."""
+
+        with self._lock:
+            return self._restart_engine()
 
     def _restart_engine(self) -> str | None:
         disconnect_error = None

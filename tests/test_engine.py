@@ -1,4 +1,6 @@
 import io
+import signal
+import time
 
 import pytest
 
@@ -69,6 +71,152 @@ class TestSubprocessEngine:
         assert result.complete is False
         assert result.error is not None
         assert result.attempts == 1
+        assert result.session_state == "draining"
+        assert result.cancellation_status == "unsupported"
+        assert result.command_id
+
+    def test_timeout_interrupts_old_command_before_accepting_next_command(self):
+        engine = SubprocessEngine(interrupt_timeout=0.1)
+        proc = _FakeProcess()
+        flush_count = 0
+        signals = []
+
+        def on_flush():
+            nonlocal flush_count
+            flush_count += 1
+            if flush_count == 1:
+                engine._output_queue.put("old partial output\n")
+            else:
+                engine._output_queue.put("fresh command output\n")
+                engine._output_queue.put(f"{_marker_from_last_write(proc)}\n")
+
+        def send_signal(value):
+            signals.append(value)
+            engine._output_queue.put("old output after timeout\n")
+            engine._output_queue.put(f"{_marker_from_last_write(proc)}\n")
+
+        proc.stdin = _FakeStdin(on_flush)
+        proc.send_signal = send_signal
+        engine._proc = proc
+        engine._connected = True
+
+        timed_out = engine.execute("lm t n", timeout=0.01)
+        following = engine.execute("? 1+1", timeout=0.1)
+
+        assert signals == [signal.CTRL_BREAK_EVENT]
+        assert timed_out.status == "timeout"
+        assert timed_out.complete is True
+        assert timed_out.cancellation_status == "confirmed"
+        assert timed_out.session_state == "idle"
+        assert timed_out.output == (
+            "old partial output\nold output after timeout\n"
+        )
+        assert following.status == "completed"
+        assert following.output == "fresh command output\n"
+        assert "old" not in following.output
+
+    def test_uninterruptible_timeout_blocks_until_old_marker_is_drained(self):
+        engine = SubprocessEngine(interrupt_timeout=0.01)
+        proc = _FakeProcess()
+        flush_count = 0
+
+        def on_flush():
+            nonlocal flush_count
+            flush_count += 1
+            if flush_count == 1:
+                engine._output_queue.put("old partial output\n")
+            else:
+                engine._output_queue.put("fresh output\n")
+                engine._output_queue.put(f"{_marker_from_last_write(proc)}\n")
+
+        proc.stdin = _FakeStdin(on_flush)
+        engine._proc = proc
+        engine._connected = True
+
+        timed_out = engine.execute("lm t n", timeout=0.01)
+        writes_after_timeout = len(proc.stdin.writes)
+        blocked = engine.execute("? 1+1", timeout=0.1)
+
+        assert timed_out.status == "timeout"
+        assert timed_out.session_state == "draining"
+        assert blocked.status == "busy"
+        assert blocked.command_id == timed_out.command_id
+        assert len(proc.stdin.writes) == writes_after_timeout
+
+        engine._output_queue.put("old late output\n")
+        engine._output_queue.put(
+            f"{native_engine.MARKER_PREFIX}{timed_out.command_id}__\n"
+        )
+        deadline = time.monotonic() + 0.5
+        while engine.session_snapshot().state != "idle":
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+
+        following = engine.execute("? 1+1", timeout=0.1)
+
+        assert following.status == "completed"
+        assert following.output == "fresh output\n"
+        assert "old" not in following.output
+
+    def test_timeout_policy_can_leave_running_command_for_explicit_interrupt(self):
+        engine = SubprocessEngine(interrupt_timeout=0.01)
+        engine, proc = _connected_engine(
+            lambda: engine._output_queue.put("target running\n")
+        )
+
+        result = engine.execute(
+            "g",
+            timeout=0.01,
+            cancel_on_timeout=False,
+        )
+
+        assert result.status == "timeout"
+        assert result.session_state == "draining"
+        assert result.cancellation_status == "not_requested"
+        assert result.output == "target running\n"
+        assert len(proc.stdin.writes) == 1
+
+    def test_running_target_can_be_interrupted_and_followed_by_fresh_command(self):
+        engine = SubprocessEngine(interrupt_timeout=0.1)
+        proc = _FakeProcess()
+        flush_count = 0
+        signals = []
+
+        def on_flush():
+            nonlocal flush_count
+            flush_count += 1
+            if flush_count == 1:
+                engine._output_queue.put("target resumed\n")
+            else:
+                engine._output_queue.put("fresh output\n")
+                engine._output_queue.put(f"{_marker_from_last_write(proc)}\n")
+
+        def send_signal(value):
+            signals.append(value)
+            engine._output_queue.put("break-in output\n")
+            engine._output_queue.put(
+                f"{native_engine.MARKER_PREFIX}{running.command_id}__\n"
+            )
+
+        proc.stdin = _FakeStdin(on_flush)
+        proc.send_signal = send_signal
+        engine._proc = proc
+        engine._connected = True
+
+        running = engine.execute("g", timeout=0.01, cancel_on_timeout=False)
+
+        assert engine.interrupt(running.command_id) is True
+        deadline = time.monotonic() + 0.5
+        while engine.session_snapshot().state != "idle":
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+
+        following = engine.execute("? 1+1", timeout=0.1)
+
+        assert signals == [signal.CTRL_BREAK_EVENT]
+        assert following.status == "completed"
+        assert following.output == "fresh output\n"
+        assert "break-in" not in following.output
 
     def test_uses_unique_command_markers_and_requires_marker_line(self, monkeypatch):
         tokens = iter(["1" * 32, "2" * 32])
@@ -116,6 +264,22 @@ class TestSubprocessEngine:
         assert result.output == "command output\n"
         assert native_engine.MARKER_PREFIX not in result.output
 
+    def test_accepts_repeated_prompts_before_marker(self):
+        engine = None
+        proc = None
+
+        def complete_command():
+            marker = _marker_from_last_write(proc)
+            engine._output_queue.put(f"2: kd> 2: kd> {marker}\n")
+
+        engine, proc = _connected_engine(complete_command)
+
+        result = engine.execute("x nt!DefinitelyMissingSymbol", timeout=0.1)
+
+        assert result.status == "completed"
+        assert result.complete is True
+        assert result.output == ""
+
     def test_preserves_output_observed_before_command(self):
         engine = None
         proc = None
@@ -125,13 +289,33 @@ class TestSubprocessEngine:
             engine._output_queue.put(f"{_marker_from_last_write(proc)}\n")
 
         engine, proc = _connected_engine(complete_command)
+        engine._pending_async_output = "debugger startup output\n"
         engine._output_queue.put("asynchronous break event\n")
 
         result = engine.execute("r", timeout=0.1)
 
         assert result.status == "completed"
         assert result.output == "command output\n"
-        assert result.async_output == "asynchronous break event\n"
+        assert result.async_output == (
+            "debugger startup output\nasynchronous break event\n"
+        )
+
+    def test_startup_marker_separates_initial_output(self):
+        engine, proc = _connected_engine()
+        marker = engine._new_marker()
+        engine._output_queue.put("debugger banner\n")
+        engine._output_queue.put("Loading Symbols\n")
+        engine._output_queue.put(f"0: kd> {marker}\n")
+
+        startup_output = engine._wait_for_startup_marker(
+            marker,
+            0.1,
+            proc,
+            engine._output_queue,
+        )
+
+        assert startup_output == "debugger banner\nLoading Symbols\n"
+        assert engine._output_queue.empty()
 
     def test_eof_returns_partial_output_and_clears_connection(self):
         engine = None
@@ -159,6 +343,58 @@ class TestSubprocessEngine:
 
         assert engine.connected is False
         assert isinstance(output_queue.get_nowait(), _StreamClosed)
+
+    def test_stale_reader_cannot_disconnect_replacement_process(self):
+        engine, old_proc = _connected_engine()
+        replacement = _FakeProcess()
+        with engine._state_lock:
+            engine._proc = replacement
+            engine._connected = True
+            engine._state = "idle"
+
+        engine._mark_disconnected(old_proc)
+
+        snapshot = engine.session_snapshot()
+        assert snapshot.connected is True
+        assert snapshot.state == "idle"
+        assert engine._proc is replacement
+
+    def test_queued_marker_survives_reader_disconnect_state_update(self):
+        engine = None
+        proc = None
+
+        def complete_then_disconnect():
+            engine._output_queue.put(f"{_marker_from_last_write(proc)}\n")
+            engine._mark_disconnected(proc, preserve_active_command=True)
+
+        engine, proc = _connected_engine(complete_then_disconnect)
+
+        result = engine.execute("r", timeout=0.1)
+
+        assert result.status == "completed"
+        assert result.complete is True
+        assert result.session_state == "disconnected"
+        assert engine.session_snapshot().active_command_id is None
+
+    def test_queued_cancel_marker_keeps_confirmation_after_reader_disconnect(self):
+        engine = SubprocessEngine(interrupt_timeout=0.1)
+        proc = _FakeProcess()
+
+        def send_signal(_value):
+            engine._output_queue.put(f"{_marker_from_last_write(proc)}\n")
+            engine._mark_disconnected(proc, preserve_active_command=True)
+
+        proc.send_signal = send_signal
+        engine._proc = proc
+        engine._connected = True
+
+        result = engine.execute("lm t n", timeout=0.01)
+
+        assert result.status == "timeout"
+        assert result.complete is True
+        assert result.cancellation_status == "confirmed"
+        assert result.session_state == "disconnected"
+        assert engine.session_snapshot().active_command_id is None
 
     @pytest.mark.parametrize("through_executor", [False, True])
     def test_eof_before_request_preserves_async_output(self, through_executor):
@@ -242,7 +478,7 @@ class _ScriptedEngine(DebugEngine):
         self.connect_count = 0
         self._connected = True
 
-    def execute(self, command, timeout=30.0):
+    def execute(self, command, timeout=30.0, *, cancel_on_timeout=True):
         self.calls.append((command, timeout))
         result = self.results.pop(0)
         if isinstance(result, Exception):
@@ -267,7 +503,7 @@ class _ScriptedEngine(DebugEngine):
 
 
 class TestCommandExecutor:
-    def test_passes_configured_timeout_and_retries_explicit_read_only_command(
+    def test_passes_configured_timeout_without_replaying_submitted_command(
         self,
         monkeypatch,
     ):
@@ -290,12 +526,41 @@ class TestCommandExecutor:
 
         result = executor.execute("r", read_only=True, retryable=True)
 
+        assert engine.calls == [("r", 1.25)]
+        assert engine.disconnect_count == 0
+        assert engine.connect_count == 0
+        assert result.status == "timeout"
+        assert result.output == "partial\n"
+        assert result.attempts == 1
+        assert result.session_restarted is False
+
+    def test_retries_only_proven_pre_submission_disconnect(self, monkeypatch):
+        monkeypatch.setattr(executor_module.time, "sleep", lambda _: None)
+        engine = _ScriptedEngine(
+            [
+                ExecutionResult(
+                    status="disconnected",
+                    error="not connected",
+                    attempts=0,
+                    session_state="disconnected",
+                ),
+                ExecutionResult(
+                    status="completed",
+                    output="rax=1\n",
+                    complete=True,
+                ),
+            ]
+        )
+        executor = CommandExecutor(engine, timeout=1.25, max_retries=2)
+
+        result = executor.execute("r", read_only=True, retryable=True)
+
         assert engine.calls == [("r", 1.25), ("r", 1.25)]
         assert engine.disconnect_count == 1
         assert engine.connect_count == 1
         assert result.status == "completed"
-        assert result.output == "partial\nrax=1\n"
-        assert result.attempts == 2
+        assert result.output == "rax=1\n"
+        assert result.attempts == 1
         assert result.session_restarted is True
 
     @pytest.mark.parametrize(

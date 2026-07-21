@@ -1,30 +1,93 @@
 import argparse
 from dataclasses import asdict
+from functools import wraps
 import json
 import logging
 import sys
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, TextContent
 
 from .config import Config
 from .debugger.engine import ExecutionContractError, ExecutionResult
 from .tools._registry import set_executor
+from .tools._models import ToolEnvelope
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 SERVER_INSTRUCTIONS = (
     "Use the typed windbg_* business tools whenever they can express the "
-    "debugging intent. Treat execution_status, parse_status, and "
-    "verification_status as independent stages; ok is true only when every "
-    "required stage succeeds. sources are the authoritative per-command "
-    "evidence, while raw is only a compatibility field. data contains "
-    "observations. inferences are explicitly inferred, and next_actions are "
-    "optional suggestions that must not be executed automatically. "
+    "debugging intent. Treat execution_status, core_result_status, "
+    "parse_status, and verification_status as independent stages; a partial "
+    "parse may still be ok when the core result is usable. data contains only "
+    "observations, inferences are explicitly inferred, limitations describe "
+    "missing target data or truncation, and next_actions are optional "
+    "suggestions that must not be executed automatically. sources contain "
+    "per-command provenance and command_id values; use windbg_output for "
+    "paged raw evidence instead of assuming raw is inlined. Check "
+    "windbg_session when the command channel is busy, draining, or poisoned. "
     "windbg_exec is a raw, open-world escape hatch that can execute "
     "destructive WinDbg commands; use it only when no business tool covers "
     "the required operation."
 )
+
+
+def _compact_summary(result: ToolEnvelope) -> str:
+    return json.dumps(
+        {
+            "tool": result.tool,
+            "ok": result.ok,
+            "execution_status": result.execution_status,
+            "core_result_status": result.core_result_status,
+            "parse_status": result.parse_status,
+            "errors": [error.code for error in result.errors],
+            "structured_content": True,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+class _CompactFastMCP(FastMCP):
+    """FastMCP variant that avoids duplicating full structured results as text."""
+
+    def add_tool(
+        self,
+        fn,
+        name=None,
+        title=None,
+        description=None,
+        annotations=None,
+        icons=None,
+        meta=None,
+        structured_output=None,
+    ) -> None:
+        registered_fn = fn
+        if structured_output is True:
+            @wraps(fn)
+            def compact_result(*args: Any, **kwargs: Any):
+                result = fn(*args, **kwargs)
+                if not isinstance(result, ToolEnvelope):
+                    return result
+                return CallToolResult(
+                    content=[TextContent(type="text", text=_compact_summary(result))],
+                    structuredContent=result.model_dump(mode="json"),
+                )
+
+            registered_fn = compact_result
+
+        super().add_tool(
+            registered_fn,
+            name=name,
+            title=title,
+            description=description,
+            annotations=annotations,
+            icons=icons,
+            meta=meta,
+            structured_output=structured_output,
+        )
 
 
 def _build_parser():
@@ -81,6 +144,8 @@ class _DebugExecutor:
         *,
         read_only: bool = False,
         retryable: bool = False,
+        timeout: float | None = None,
+        cancel_on_timeout: bool = True,
     ) -> ExecutionResult:
         print("=== REQUEST ===", flush=True)
         print(
@@ -89,16 +154,22 @@ class _DebugExecutor:
                     "command": command,
                     "read_only": read_only,
                     "retryable": retryable,
+                    "timeout": timeout,
+                    "cancel_on_timeout": cancel_on_timeout,
                 },
                 indent=2,
             ),
             flush=True,
         )
-        result = self._e.execute(
-            command,
-            read_only=read_only,
-            retryable=retryable,
-        )
+        policy = {
+            "read_only": read_only,
+            "retryable": retryable,
+        }
+        if timeout is not None:
+            policy["timeout"] = timeout
+        if not cancel_on_timeout:
+            policy["cancel_on_timeout"] = False
+        result = self._e.execute(command, **policy)
         if not isinstance(result, ExecutionResult):
             raise ExecutionContractError("wrapped executor must return ExecutionResult")
         try:
@@ -114,6 +185,15 @@ class _DebugExecutor:
         print(json.dumps(response, indent=2), flush=True)
         return result
 
+    def session_snapshot(self):
+        return self._e.session_snapshot()
+
+    def interrupt(self, command_id=None):
+        return self._e.interrupt(command_id)
+
+    def recover(self):
+        return self._e.recover()
+
 
 def create_mcp_server(
     *,
@@ -121,7 +201,7 @@ def create_mcp_server(
     port: int = 8080,
 ) -> FastMCP:
     """Create the configured FastMCP surface without starting a transport."""
-    mcp = FastMCP(
+    mcp = _CompactFastMCP(
         "windbg-mcp",
         instructions=SERVER_INSTRUCTIONS,
         host=host,
@@ -139,6 +219,14 @@ def create_mcp_server(
     from .tools.eval_tool import register_eval_tool
     from .tools.context_tool import register_context_tool
     from .tools.sympath_tool import register_sympath_tool
+    from .tools.session_tool import register_session_tool
+    from .tools.output_tool import register_output_tool
+    from .tools.thread_tool import register_thread_tool
+    from .tools.module_tool import register_module_tool
+    from .tools.mapping_tool import register_mapping_tool
+    from .tools.pool_tool import register_pool_tool
+    from .tools.blackbox_tool import register_blackbox_tool
+    from .tools.image_verify_tool import register_image_verify_tool
 
     for register in (
         register_exec_tool,
@@ -152,6 +240,14 @@ def create_mcp_server(
         register_eval_tool,
         register_context_tool,
         register_sympath_tool,
+        register_session_tool,
+        register_output_tool,
+        register_thread_tool,
+        register_module_tool,
+        register_mapping_tool,
+        register_pool_tool,
+        register_blackbox_tool,
+        register_image_verify_tool,
     ):
         register(mcp)
     return mcp
@@ -178,10 +274,15 @@ def main():
             exe=args.exe or None,
             dump=args.dump or None,
             cmd_args=args.args or "",
+            interrupt_timeout=config.interrupt_timeout,
         )
     else:
         from .debugger.native_engine import SubprocessEngine
-        engine = SubprocessEngine(remote_host=host, remote_port=port)
+        engine = SubprocessEngine(
+            remote_host=host,
+            remote_port=port,
+            interrupt_timeout=config.interrupt_timeout,
+        )
 
     from .debugger.executor import CommandExecutor
     executor_base = CommandExecutor(engine, timeout=config.command_timeout, max_retries=config.max_retries)

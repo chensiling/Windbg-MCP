@@ -6,7 +6,12 @@ from typing import Literal
 from ._annotations import READ_ONLY_TOOL
 from ._evidence import resolve_expression, run_read
 from ._models import ToolEnvelope
-from ._parser import parse_nearest_symbol, parse_symbol_list, parse_type_info
+from ._parser import (
+    parse_function_info,
+    parse_nearest_symbol,
+    parse_symbol_list,
+    parse_type_info,
+)
 from ._response import (
     error_item,
     inference_item,
@@ -16,7 +21,7 @@ from ._response import (
 )
 
 
-LookupKind = Literal["auto", "address", "symbol", "type"]
+LookupKind = Literal["auto", "address", "symbol", "type", "function"]
 
 
 def _auto_route(value: str) -> tuple[str, str]:
@@ -45,12 +50,12 @@ def register_lookup_tool(mcp):
         if input_error:
             return make_response("windbg_lookup", errors=[input_error])
         requested_kind = kind.lower().strip()
-        if requested_kind not in ("auto", "address", "symbol", "type"):
+        if requested_kind not in ("auto", "address", "symbol", "type", "function"):
             return make_response(
                 "windbg_lookup",
                 errors=[error_item(
                     "invalid_argument",
-                    "'kind' must be auto, address, symbol, or type.",
+                    "'kind' must be auto, address, symbol, type, or function.",
                 )],
             )
 
@@ -77,8 +82,11 @@ def register_lookup_tool(mcp):
         elif route == "symbol":
             evidence = run_read(f"x {what.strip()}", parse_symbol_list)
             sources = [evidence.source]
-        else:
+        elif route == "type":
             evidence = run_read(f"dt {what.strip()}", parse_type_info)
+            sources = [evidence.source]
+        else:
+            evidence = run_read(f".fnent {what.strip()}", parse_function_info)
             sources = [evidence.source]
 
         if evidence.parsed is not None:
@@ -96,4 +104,7 @@ def register_lookup_tool(mcp):
             data,
             inferences=inferences,
             next_actions=actions,
+            core_result_status=(
+                "empty" if data.get("found") is False else None
+            ),
         )
